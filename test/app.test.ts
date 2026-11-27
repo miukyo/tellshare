@@ -10,6 +10,14 @@ import {
 } from '../src/crypto'
 import { FileDatabase } from '../src/db'
 import {
+  MultipartAbortedError,
+  MultipartBadRequestError,
+  MultipartPayloadTooLargeError,
+  MultipartTruncatedError,
+  extractMultipartBoundary,
+  parseMultipartStream,
+} from '../src/multipart'
+import {
   ChannelSetupClient,
   DownloadStreamOptions,
   SetupBackend,
@@ -22,6 +30,7 @@ import {
   ensureStorageChannel,
   isRetryableUploadError,
   normalizeBareChannelId,
+  selectDownloadPlan,
 } from '../src/telegram'
 
 class MockStorage implements StorageBackend {
@@ -682,6 +691,30 @@ describe('TellShare Hono app', () => {
     expect(dupGet.status).toBe(200)
     expect(await dupGet.text()).toBe(plaintext)
   })
+
+  it('returns 400 and leaves no orphaned records when multipart stream is truncated before closing boundary', async () => {
+    const boundary = '----TellShareTruncatedBoundary123'
+    const truncatedBody = [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="file"; filename="partial.bin"',
+      'Content-Type: application/octet-stream',
+      '',
+      'partial-payload-without-closing-boundary',
+    ].join('\r\n')
+
+    const res = await app.request('http://localhost:3000/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      },
+      body: truncatedBody,
+    })
+
+    expect(res.status).toBe(400)
+    expect(await res.text()).toContain('interrupted or truncated')
+    expect(db.getStats().count).toBe(0)
+    expect(storage.objects.size).toBe(0)
+  })
 })
 
 describe('ensureStorageChannel', () => {
@@ -809,5 +842,218 @@ describe('AES-256-CTR helpers', () => {
     const decipher = createSeekedDecipher(TEST_ENCRYPTION_KEY, salt, iv, 21)
     const decryptedSlice = Buffer.concat([decipher.update(encrypted.subarray(21)), decipher.final()])
     expect(decryptedSlice.toString('utf8')).toBe(plain.subarray(21).toString('utf8'))
+  })
+})
+
+describe('parseMultipartStream', () => {
+  function chunkStream(data: Uint8Array | string, step: number): ReadableStream<Uint8Array> {
+    const bytes = typeof data === 'string' ? Buffer.from(data, 'utf8') : data
+    let offset = 0
+    return new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (offset >= bytes.length) {
+          controller.close()
+          return
+        }
+        const next = Math.min(bytes.length, offset + step)
+        controller.enqueue(bytes.subarray(offset, next))
+        offset = next
+      },
+    })
+  }
+
+  it('extracts quoted and unquoted boundaries from Content-Type', () => {
+    expect(extractMultipartBoundary('multipart/form-data; boundary=----abc123')).toBe('----abc123')
+    expect(extractMultipartBoundary('MULTIPART/FORM-DATA; charset=utf-8; Boundary="quoted-B"')).toBe(
+      'quoted-B'
+    )
+    expect(extractMultipartBoundary('application/json')).toBeNull()
+    expect(extractMultipartBoundary(undefined)).toBeNull()
+  })
+
+  it('parses file uploads with arbitrary tiny chunk splits across boundaries and filename*', async () => {
+    const boundary = '----SplitTestBoundary99'
+    const rawPayload = Buffer.from(
+      'Hello \r\n--almost-boundary\r\n--' + 'X'.repeat(200) + '\r\n--end',
+      'utf8'
+    )
+    const body = Buffer.concat([
+      Buffer.from(
+        `--${boundary}\r\n` +
+          `Content-Disposition: form-data; name="note"\r\n\r\n` +
+          `ignored metadata\r\n` +
+          `--${boundary}\r\n` +
+          `Content-Disposition: form-data; name="file"; filename="fallback.bin"; filename*=UTF-8''my%20file.txt\r\n` +
+          `Content-Type: text/plain\r\n\r\n`,
+        'utf8'
+      ),
+      rawPayload,
+      Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
+    ])
+
+    for (const step of [1, 7, 64]) {
+      const received: Buffer[] = []
+      let started: { filename: string; mimeType: string } | null = null
+      let ended = false
+
+      const result = await parseMultipartStream({
+        body: chunkStream(body, step),
+        boundary,
+        maxFileSize: 1024 * 1024,
+        onFileStart: (info) => {
+          started = info
+        },
+        onFileChunk: (chunk) => {
+          received.push(Buffer.from(chunk))
+        },
+        onFileEnd: () => {
+          ended = true
+        },
+      })
+
+      expect(started!).toEqual({ filename: 'my file.txt', mimeType: 'text/plain' })
+      expect(ended).toBe(true)
+      expect(Buffer.concat(received)).toEqual(rawPayload)
+      expect(result.file).toEqual({
+        filename: 'my file.txt',
+        mimeType: 'text/plain',
+        size: rawPayload.length,
+      })
+      expect(result.url).toBeUndefined()
+    }
+  })
+
+  it('parses url field and rejects duplicate file+url, oversize, truncated, and aborted streams', async () => {
+    const boundary = '----FieldTests77'
+    const urlOnly = [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="url"',
+      '',
+      '  https://example.com/demo.png  ',
+      `--${boundary}--`,
+      '',
+    ].join('\r\n')
+
+    const urlRes = await parseMultipartStream({
+      body: chunkStream(urlOnly, 5),
+      boundary,
+      maxFileSize: 1024,
+      onFileChunk: () => {},
+    })
+    expect(urlRes.url).toBe('https://example.com/demo.png')
+    expect(urlRes.file).toBeUndefined()
+
+    const both = [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="file"; filename="a.txt"',
+      'Content-Type: text/plain',
+      '',
+      'abc',
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="url"',
+      '',
+      'https://example.com/b.txt',
+      `--${boundary}--`,
+    ].join('\r\n')
+
+    await expect(
+      parseMultipartStream({
+        body: chunkStream(both, 11),
+        boundary,
+        maxFileSize: 1024,
+        onFileChunk: () => {},
+      })
+    ).rejects.toBeInstanceOf(MultipartBadRequestError)
+
+    const tooBig = [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="file"; filename="big.bin"',
+      '',
+      '0123456789ABCDEF',
+      `--${boundary}--`,
+    ].join('\r\n')
+
+    await expect(
+      parseMultipartStream({
+        body: chunkStream(tooBig, 4),
+        boundary,
+        maxFileSize: 10,
+        onFileChunk: () => {},
+      })
+    ).rejects.toBeInstanceOf(MultipartPayloadTooLargeError)
+
+    const truncated = [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="file"; filename="cut.bin"',
+      '',
+      'half',
+    ].join('\r\n')
+
+    await expect(
+      parseMultipartStream({
+        body: chunkStream(truncated, 3),
+        boundary,
+        maxFileSize: 1024,
+        onFileChunk: () => {},
+      })
+    ).rejects.toBeInstanceOf(MultipartTruncatedError)
+
+    const ac = new AbortController()
+    ac.abort()
+    await expect(
+      parseMultipartStream({
+        body: chunkStream(urlOnly, 10),
+        boundary,
+        maxFileSize: 1024,
+        signal: ac.signal,
+        onFileChunk: () => {},
+      })
+    ).rejects.toBeInstanceOf(MultipartAbortedError)
+  })
+})
+
+describe('selectDownloadPlan', () => {
+  it('uses 512 KB chunks for full large downloads and no fixed limit', () => {
+    expect(selectDownloadPlan(0, 50_000_000, 50_000_000)).toEqual({
+      alignedOffset: 0,
+      skipBytes: 0,
+      partSizeKb: 512,
+      limit: undefined,
+    })
+  })
+
+  it('uses 64 KB chunks and a power-of-2 limit for small head range probes', () => {
+    expect(selectDownloadPlan(0, 1024, 50_000_000)).toEqual({
+      alignedOffset: 0,
+      skipBytes: 0,
+      partSizeKb: 64,
+      limit: 4096,
+    })
+
+    // Non-zero offset still aligning to 0 covers skipBytes + maxBytes
+    expect(selectDownloadPlan(50_000, 30_000, 50_000_000)).toEqual({
+      alignedOffset: 0,
+      skipBytes: 50_000,
+      partSizeKb: 64,
+      limit: 131072,
+    })
+
+    // Omits limit when rounded size >= fileSize
+    expect(selectDownloadPlan(0, 100, 1024)).toEqual({
+      alignedOffset: 0,
+      skipBytes: 0,
+      partSizeKb: 64,
+      limit: undefined,
+    })
+  })
+
+  it('aligns mid-file range offsets to chunk boundaries divisible by 4096 and partSizeKb*1024', () => {
+    const plan = selectDownloadPlan(5_000_000, 100_000, 50_000_000)
+    expect(plan.partSizeKb).toBe(128)
+    const chunkSize = plan.partSizeKb * 1024
+    expect(plan.alignedOffset % 4096).toBe(0)
+    expect(plan.alignedOffset % chunkSize).toBe(0)
+    expect(plan.alignedOffset + plan.skipBytes).toBe(5_000_000)
+    expect(plan.limit).toBeUndefined()
   })
 })

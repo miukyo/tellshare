@@ -80,21 +80,41 @@ export function createDecryptStream(
   byteOffset: number = 0
 ): ReadableStream<Uint8Array> {
   const decipher = createSeekedDecipher(masterKey, saltHex, ivHex, byteOffset)
-  const transform = new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      if (chunk.byteLength === 0) return
-      const out = decipher.update(chunk)
-      if (out.byteLength > 0) {
-        controller.enqueue(new Uint8Array(out))
+  const reader = source.getReader()
+  let finished = false
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) {
+            finished = true
+            const tail = decipher.final()
+            if (tail.byteLength > 0) {
+              controller.enqueue(new Uint8Array(tail.buffer, tail.byteOffset, tail.byteLength))
+            }
+            controller.close()
+            return
+          }
+          if (value.byteLength === 0) continue
+          const out = decipher.update(value)
+          if (out.byteLength > 0) {
+            controller.enqueue(new Uint8Array(out.buffer, out.byteOffset, out.byteLength))
+            return
+          }
+        }
+      } catch (err) {
+        finished = true
+        reader.cancel().catch(() => {})
+        controller.error(err)
       }
     },
-    flush(controller) {
-      const tail = decipher.final()
-      if (tail.byteLength > 0) {
-        controller.enqueue(new Uint8Array(tail))
+    cancel() {
+      if (!finished) {
+        finished = true
+        reader.cancel().catch(() => {})
       }
     },
   })
-
-  return source.pipeThrough(transform)
 }

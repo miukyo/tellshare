@@ -1,7 +1,9 @@
 import { mkdirSync } from 'node:fs'
+import { open } from 'node:fs/promises'
 import path from 'node:path'
 import QRCode from 'qrcode'
 import {
+  BaseTelegramClient,
   FileDownloadLocation,
   FileLocation,
   InputPeerLike,
@@ -23,6 +25,7 @@ export interface DownloadStreamOptions {
   chatId: string
   messageId: number
   fileId: string | null
+  fileSize?: number
   offset?: number
   limit?: number
   signal?: AbortSignal
@@ -108,37 +111,102 @@ function isFileReferenceError(err: unknown): boolean {
   return false
 }
 
-function linkAbortSignals(external?: AbortSignal): AbortController {
-  const internal = new AbortController()
-  if (!external) return internal
-  if (external.aborted) {
-    internal.abort(external.reason)
-    return internal
+function linkAbortSignals(external?: AbortSignal): {
+  controller: AbortController
+  unlink: () => void
+} {
+  const controller = new AbortController()
+  if (!external) {
+    return { controller, unlink: () => {} }
   }
-  external.addEventListener('abort', () => internal.abort(external.reason), { once: true })
-  return internal
+  if (external.aborted) {
+    controller.abort(external.reason)
+    return { controller, unlink: () => {} }
+  }
+  const onAbort = () => controller.abort(external.reason)
+  external.addEventListener('abort', onAbort, { once: true })
+  return {
+    controller,
+    unlink: () => external.removeEventListener('abort', onAbort),
+  }
+}
+
+export interface DownloadPlan {
+  alignedOffset: number
+  skipBytes: number
+  partSizeKb: number
+  limit?: number
+}
+
+export function selectDownloadPlan(
+  offset: number,
+  maxBytes: number,
+  fileSize?: number
+): DownloadPlan {
+  let partSizeKb: number
+  if (maxBytes <= 64 * 1024) {
+    partSizeKb = 64
+  } else if (maxBytes <= 256 * 1024) {
+    partSizeKb = 128
+  } else if (offset === 0 && (fileSize ?? maxBytes) >= 1024 * 1024) {
+    partSizeKb = 512
+  } else {
+    partSizeKb = 256
+  }
+
+  const chunkSize = partSizeKb * 1024
+  const alignedOffset = Math.floor(offset / chunkSize) * chunkSize
+  const skipBytes = offset - alignedOffset
+
+  let limit: number | undefined
+  const endNeeded = skipBytes + maxBytes
+  if (alignedOffset === 0 && Number.isFinite(endNeeded) && endNeeded > 0 && endNeeded <= 1048576) {
+    let rounded = 4096
+    while (rounded < endNeeded && rounded < 1048576) {
+      rounded *= 2
+    }
+    if (fileSize === undefined || rounded < fileSize) {
+      limit = rounded
+    }
+  }
+
+  return { alignedOffset, skipBytes, partSizeKb, limit }
+}
+
+interface ProbedIterable {
+  firstChunk: Uint8Array | null
+  iterator: AsyncIterableIterator<Uint8Array>
+  abortController: AbortController
+  unlinkAbort: () => void
+  setThrottle: (fn: () => Promise<void> | undefined) => void
 }
 
 /**
- * Slices a 4096-aligned source stream down to an arbitrary byte range [skipBytes, skipBytes + maxBytes).
+ * Wraps a single downloadAsIterable stream directly with chunk-aligned slicing and 1 MiB pull-based backpressure.
  */
-function createBoundedStream(
-  firstChunk: Uint8Array,
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  abortController: AbortController,
+function createDownloadReadableStream(
+  probed: ProbedIterable,
   skipBytes: number,
   maxBytes: number
 ): ReadableStream<Uint8Array> {
-  let pendingFirst: Uint8Array | null = firstChunk
   let skipRemaining = skipBytes
   let bytesRemaining = maxBytes
   let finished = false
+  const pullWaiters: Array<() => void> = []
+
+  const wakeAllWaiters = () => {
+    while (pullWaiters.length > 0) {
+      pullWaiters.pop()!()
+    }
+  }
 
   const cleanup = () => {
     if (finished) return
     finished = true
-    reader.cancel().catch(() => {})
-    abortController.abort()
+    wakeAllWaiters()
+    probed.unlinkAbort()
+    probed.abortController.abort()
+    void probed.iterator.return?.().catch(() => {})
   }
 
   const processChunk = (chunk: Uint8Array): Uint8Array | null => {
@@ -163,48 +231,63 @@ function createBoundedStream(
     return slice.byteLength > 0 ? slice : null
   }
 
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      try {
-        while (!finished) {
-          let chunk: Uint8Array
-          if (pendingFirst !== null) {
-            chunk = pendingFirst
-            pendingFirst = null
-          } else {
-            const next = await reader.read()
-            if (next.done) {
-              cleanup()
-              controller.close()
-              return
-            }
-            chunk = next.value
+  return new ReadableStream<Uint8Array>(
+    {
+      start(controller) {
+        probed.setThrottle(() => {
+          if (finished) return undefined
+          if (controller.desiredSize !== null && controller.desiredSize <= 0) {
+            return new Promise<void>((resolve) => {
+              pullWaiters.push(resolve)
+            })
           }
+          return undefined
+        })
 
-          const out = processChunk(chunk)
-          if (out) {
-            controller.enqueue(out)
-            if (bytesRemaining === 0) {
+        ;(async () => {
+          try {
+            if (probed.firstChunk) {
+              const out = processChunk(probed.firstChunk)
+              if (out) {
+                controller.enqueue(out)
+              }
+            }
+
+            while (!finished && bytesRemaining > 0) {
+              const next = await probed.iterator.next()
+              if (finished || next.done || !next.value) {
+                break
+              }
+              const out = processChunk(next.value)
+              if (out) {
+                controller.enqueue(out)
+              }
+            }
+
+            if (!finished) {
               cleanup()
               controller.close()
             }
-            return
+          } catch (err) {
+            if (!finished) {
+              cleanup()
+              controller.error(err)
+            }
           }
-          if (bytesRemaining === 0) {
-            cleanup()
-            controller.close()
-            return
-          }
-        }
-      } catch (err) {
+        })()
+      },
+      pull() {
+        wakeAllWaiters()
+      },
+      cancel() {
         cleanup()
-        controller.error(err)
-      }
+      },
     },
-    cancel() {
-      cleanup()
-    },
-  })
+    {
+      highWaterMark: 1024 * 1024,
+      size: (chunk) => chunk?.byteLength ?? 0,
+    }
+  )
 }
 
 export interface StorageChannelPeer {
@@ -294,11 +377,17 @@ export class TelegramStorage implements StorageBackend, SetupBackend {
     assertTelegramConfig(config)
     this.config = config
     mkdirSync(config.dataDir, { recursive: true })
-    this.client = new TelegramClient({
+    const baseClient = new BaseTelegramClient({
       apiId: config.apiId,
       apiHash: config.apiHash,
       storage: path.join(config.dataDir, 'telegram.session'),
+      updates: false,
+      network: {
+        connectionCount: (kind) =>
+          kind === 'main' ? 0 : kind === 'upload' ? 3 : kind === 'download' ? 2 : 1,
+      },
     })
+    this.client = new TelegramClient({ client: baseClient })
   }
 
   isConnected(): boolean {
@@ -694,9 +783,19 @@ export class TelegramStorage implements StorageBackend, SetupBackend {
     let uploaded: UploadedFile | null = null
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const fh = await open(opts.filePath, 'r')
+      let readPos = 0
+      const fileReader = {
+        async read(into: Uint8Array): Promise<number> {
+          const { bytesRead } = await fh.read(into, 0, into.byteLength, readPos)
+          readPos += bytesRead
+          return bytesRead
+        },
+      }
+
       try {
         uploaded = await this.client.uploadFile({
-          file: Bun.file(opts.filePath),
+          file: fileReader,
           fileName: opts.filename,
           fileMime: opts.mimeType,
           fileSize: opts.size,
@@ -713,6 +812,8 @@ export class TelegramStorage implements StorageBackend, SetupBackend {
           `[tellshare] Telegram upload attempt ${attempt}/${maxAttempts} failed (${err instanceof Error ? err.message : String(err)}); retrying in ${delayMs}ms...`
         )
         await Bun.sleep(delayMs)
+      } finally {
+        await fh.close().catch(() => {})
       }
     }
 
@@ -757,32 +858,50 @@ export class TelegramStorage implements StorageBackend, SetupBackend {
     }
   }
 
-  private async openProbedStream(
+  private async openProbedIterable(
     location: FileDownloadLocation,
-    alignedOffset: number,
+    plan: DownloadPlan,
+    fileSize: number | undefined,
     externalSignal?: AbortSignal
-  ): Promise<{
-    firstChunk: Uint8Array | null
-    reader: ReadableStreamDefaultReader<Uint8Array>
-    abortController: AbortController
-  }> {
-    const abortController = linkAbortSignals(externalSignal)
-    const rawStream = this.client.downloadAsStream(location, {
-      offset: alignedOffset,
+  ): Promise<ProbedIterable> {
+    const { controller: abortController, unlink: unlinkAbort } = linkAbortSignals(externalSignal)
+    let throttleImpl: (() => Promise<void> | undefined) | null = null
+    const iterator = this.client.downloadAsIterable(location, {
+      offset: plan.alignedOffset,
+      fileSize,
+      partSize: plan.partSizeKb,
+      limit: plan.limit,
       abortSignal: abortController.signal,
+      throttle: () => throttleImpl?.(),
     })
-    const reader = rawStream.getReader()
+
     try {
-      const first = await reader.read()
-      if (first.done) {
-        reader.cancel().catch(() => {})
+      const first = await iterator.next()
+      if (first.done || !first.value) {
+        await iterator.return?.().catch(() => {})
         abortController.abort()
-        return { firstChunk: null, reader, abortController }
+        unlinkAbort()
+        return {
+          firstChunk: null,
+          iterator,
+          abortController,
+          unlinkAbort,
+          setThrottle: () => {},
+        }
       }
-      return { firstChunk: first.value, reader, abortController }
+      return {
+        firstChunk: first.value,
+        iterator,
+        abortController,
+        unlinkAbort,
+        setThrottle: (fn) => {
+          throttleImpl = fn
+        },
+      }
     } catch (err) {
-      reader.cancel().catch(() => {})
+      await iterator.return?.().catch(() => {})
       abortController.abort()
+      unlinkAbort()
       throw err
     }
   }
@@ -798,8 +917,7 @@ export class TelegramStorage implements StorageBackend, SetupBackend {
       })
     }
 
-    const alignedOffset = Math.floor(offset / 4096) * 4096
-    const skipBytes = offset - alignedOffset
+    const plan = selectDownloadPlan(offset, maxBytes, opts.fileSize)
 
     let location: FileDownloadLocation
     if (opts.fileId) {
@@ -812,14 +930,9 @@ export class TelegramStorage implements StorageBackend, SetupBackend {
       }
     }
 
-    let opened: {
-      firstChunk: Uint8Array | null
-      reader: ReadableStreamDefaultReader<Uint8Array>
-      abortController: AbortController
-    }
-
+    let probed: ProbedIterable
     try {
-      opened = await this.openProbedStream(location, alignedOffset, opts.signal)
+      probed = await this.openProbedIterable(location, plan, opts.fileSize, opts.signal)
     } catch (err) {
       if (!isFileReferenceError(err)) {
         throw err
@@ -829,10 +942,10 @@ export class TelegramStorage implements StorageBackend, SetupBackend {
       if (resolved.fileId) {
         opts.onRefreshedFileId?.(resolved.fileId)
       }
-      opened = await this.openProbedStream(resolved.location, alignedOffset, opts.signal)
+      probed = await this.openProbedIterable(resolved.location, plan, opts.fileSize, opts.signal)
     }
 
-    if (!opened.firstChunk) {
+    if (!probed.firstChunk) {
       return new ReadableStream<Uint8Array>({
         start(controller) {
           controller.close()
@@ -840,13 +953,7 @@ export class TelegramStorage implements StorageBackend, SetupBackend {
       })
     }
 
-    return createBoundedStream(
-      opened.firstChunk,
-      opened.reader,
-      opened.abortController,
-      skipBytes,
-      maxBytes
-    )
+    return createDownloadReadableStream(probed, plan.skipBytes, maxBytes)
   }
 
   async deleteFile(opts: { chatId: string; messageId: number }): Promise<void> {

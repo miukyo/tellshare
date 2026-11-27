@@ -1,5 +1,5 @@
 import { Cipheriv, createHash, randomBytes, randomUUID } from 'node:crypto'
-import { createWriteStream } from 'node:fs'
+import { WriteStream, createWriteStream } from 'node:fs'
 import { unlink } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -11,6 +11,14 @@ import {
   generateFileEncryptionParams,
 } from './crypto'
 import { FileDatabase, FileRecord } from './db'
+import {
+  MultipartAbortedError,
+  MultipartBadRequestError,
+  MultipartPayloadTooLargeError,
+  MultipartTruncatedError,
+  extractMultipartBoundary,
+  parseMultipartStream,
+} from './multipart'
 import { SetupBackend, StorageBackend, TelegramObjectNotFoundError } from './telegram'
 import {
   generateId,
@@ -114,6 +122,48 @@ function extractFilenameFromHeaders(contentDisposition: string | null, url: URL)
   return sanitizeFilename(segment || 'download')
 }
 
+async function writeChunkToStream(writeStream: WriteStream, buf: Uint8Array): Promise<void> {
+  if (buf.byteLength === 0) return
+  if (!writeStream.write(buf)) {
+    await new Promise<void>((resolve, reject) => {
+      const onDrain = () => {
+        writeStream.off('error', onError)
+        resolve()
+      }
+      const onError = (err: Error) => {
+        writeStream.off('drain', onDrain)
+        reject(err)
+      }
+      writeStream.once('drain', onDrain)
+      writeStream.once('error', onError)
+    })
+  }
+}
+
+async function finishWriteStream(writeStream: WriteStream): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const onFinish = () => {
+      writeStream.off('error', onError)
+      resolve()
+    }
+    const onError = (err: Error) => {
+      writeStream.off('finish', onFinish)
+      reject(err)
+    }
+    writeStream.once('finish', onFinish)
+    writeStream.once('error', onError)
+    writeStream.end()
+  })
+}
+
+async function destroyWriteStream(writeStream: WriteStream): Promise<void> {
+  if (writeStream.destroyed || writeStream.closed) return
+  await new Promise<void>((resolve) => {
+    writeStream.once('close', () => resolve())
+    writeStream.destroy()
+  })
+}
+
 async function spoolStreamToTempFile(
   stream: ReadableStream<Uint8Array>,
   maxFileSize: number,
@@ -121,27 +171,9 @@ async function spoolStreamToTempFile(
 ): Promise<{ tempPath: string; size: number; sha256: string }> {
   const tempPath = path.join(os.tmpdir(), `tellshare-${randomUUID()}`)
   const hasher = createHash('sha256')
-  const writeStream = createWriteStream(tempPath, { flags: 'wx' })
+  const writeStream = createWriteStream(tempPath, { flags: 'wx', highWaterMark: 256 * 1024 })
   const reader = stream.getReader()
   let totalSize = 0
-
-  const writeChunk = async (buf: Uint8Array) => {
-    if (buf.byteLength === 0) return
-    if (!writeStream.write(buf)) {
-      await new Promise<void>((resolve, reject) => {
-        const onDrain = () => {
-          writeStream.off('error', onError)
-          resolve()
-        }
-        const onError = (err: Error) => {
-          writeStream.off('drain', onDrain)
-          reject(err)
-        }
-        writeStream.once('drain', onDrain)
-        writeStream.once('error', onError)
-      })
-    }
-  }
 
   try {
     while (true) {
@@ -152,24 +184,11 @@ async function spoolStreamToTempFile(
         throw new PayloadTooLargeError(`File exceeds max size of ${maxFileSize} bytes`)
       }
       hasher.update(value)
-      await writeChunk(cipher.update(value))
+      await writeChunkToStream(writeStream, cipher.update(value))
     }
 
-    await writeChunk(cipher.final())
-
-    await new Promise<void>((resolve, reject) => {
-      const onFinish = () => {
-        writeStream.off('error', onError)
-        resolve()
-      }
-      const onError = (err: Error) => {
-        writeStream.off('finish', onFinish)
-        reject(err)
-      }
-      writeStream.once('finish', onFinish)
-      writeStream.once('error', onError)
-      writeStream.end()
-    })
+    await writeChunkToStream(writeStream, cipher.final())
+    await finishWriteStream(writeStream)
 
     return {
       tempPath,
@@ -178,7 +197,7 @@ async function spoolStreamToTempFile(
     }
   } catch (err) {
     reader.cancel().catch(() => {})
-    writeStream.destroy()
+    await destroyWriteStream(writeStream)
     await unlink(tempPath).catch(() => {})
     throw err
   }
@@ -363,25 +382,28 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
       return c.text('Telegram not configured yet. Complete setup at /\n', 503)
     }
 
-    let formData: FormData
-    try {
-      formData = await c.req.raw.formData()
-    } catch {
+    const contentType = c.req.header('content-type')
+    const boundary = extractMultipartBoundary(contentType)
+    const isUrlEncoded = Boolean(
+      contentType &&
+        contentType.trim().toLowerCase().startsWith('application/x-www-form-urlencoded')
+    )
+
+    if (!boundary && !isUrlEncoded) {
       return c.text('Invalid multipart/form-data request\n', 400)
     }
 
-    const fileEntry = formData.get('file')
-    const urlEntry = formData.get('url')
-
-    const hasFile = fileEntry instanceof File
-    const hasUrl = typeof urlEntry === 'string' && urlEntry.trim().length > 0
-
-    if ((hasFile && hasUrl) || (!hasFile && !hasUrl)) {
-      return c.text('Provide exactly one of "file" or "url"\n', 400)
-    }
-
-    if (hasUrl && !config.allowUrlUpload) {
-      return c.text('Remote URL uploads are disabled\n', 403)
+    const rawContentLength = c.req.header('content-length')
+    const parsedContentLength = rawContentLength ? Number.parseInt(rawContentLength, 10) : NaN
+    const expectedContentLength =
+      Number.isFinite(parsedContentLength) && parsedContentLength >= 0
+        ? parsedContentLength
+        : undefined
+    if (
+      expectedContentLength !== undefined &&
+      expectedContentLength > config.maxFileSize + 2 * 1024 * 1024
+    ) {
+      return c.text(`File exceeds max size of ${config.maxFileSize} bytes\n`, 413)
     }
 
     const nowMs = Date.now()
@@ -391,6 +413,7 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
     }
 
     let tempPath: string | null = null
+    let writeStream: WriteStream | null = null
     let filename = 'file'
     let mimeType = 'application/octet-stream'
     let size = 0
@@ -400,23 +423,72 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
     const cipher = createFileCipher(encryptionKey, newSalt, newIv)
 
     try {
-      if (hasFile) {
-        const uploaded = fileEntry as File
-        if (uploaded.size > config.maxFileSize) {
-          return c.text(`File exceeds max size of ${config.maxFileSize} bytes\n`, 413)
+      let urlToFetch: string | null = null
+
+      if (boundary) {
+        const reqBody = c.req.raw.body
+        if (!reqBody) {
+          return c.text('Invalid multipart/form-data request\n', 400)
         }
-        const spooled = await spoolStreamToTempFile(uploaded.stream(), config.maxFileSize, cipher)
-        tempPath = spooled.tempPath
-        size = spooled.size
-        sha256 = spooled.sha256
-        filename = sanitizeFilename(uploaded.name || 'file')
-        mimeType = inferMimeType(filename, uploaded.type)
+
+        const hasher = createHash('sha256')
+        const parsed = await parseMultipartStream({
+          body: reqBody,
+          boundary,
+          maxFileSize: config.maxFileSize,
+          signal: c.req.raw.signal,
+          onFileStart: (info) => {
+            filename = sanitizeFilename(info.filename || 'file')
+            mimeType = inferMimeType(filename, info.mimeType)
+            tempPath = path.join(os.tmpdir(), `tellshare-${randomUUID()}`)
+            writeStream = createWriteStream(tempPath, {
+              flags: 'wx',
+              highWaterMark: 256 * 1024,
+            })
+          },
+          onFileChunk: async (chunk) => {
+            hasher.update(chunk)
+            await writeChunkToStream(writeStream!, cipher.update(chunk))
+          },
+          onFileEnd: async () => {
+            if (writeStream) {
+              await writeChunkToStream(writeStream, cipher.final())
+              await finishWriteStream(writeStream)
+              writeStream = null
+            }
+          },
+        })
+
+        if (parsed.file && parsed.url) {
+          return c.text('Provide exactly one of "file" or "url"\n', 400)
+        }
+        if (parsed.file) {
+          size = parsed.file.size
+          sha256 = hasher.digest('hex')
+        } else if (parsed.url) {
+          urlToFetch = parsed.url
+        } else {
+          return c.text('Provide exactly one of "file" or "url"\n', 400)
+        }
       } else {
-        const remote = await fetchRemoteUrlToTempFile(
-          urlEntry as string,
-          config.maxFileSize,
-          cipher
-        )
+        let formData: FormData
+        try {
+          formData = await c.req.raw.formData()
+        } catch {
+          return c.text('Invalid form data\n', 400)
+        }
+        const urlEntry = formData.get('url')
+        if (typeof urlEntry !== 'string' || !urlEntry.trim()) {
+          return c.text('Provide exactly one of "file" or "url"\n', 400)
+        }
+        urlToFetch = urlEntry.trim()
+      }
+
+      if (urlToFetch) {
+        if (!config.allowUrlUpload) {
+          return c.text('Remote URL uploads are disabled\n', 403)
+        }
+        const remote = await fetchRemoteUrlToTempFile(urlToFetch, config.maxFileSize, cipher)
         tempPath = remote.tempPath
         size = remote.size
         sha256 = remote.sha256
@@ -424,7 +496,7 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
         mimeType = inferMimeType(filename, remote.mimeType)
       }
 
-      if (size === 0) {
+      if (size === 0 || !tempPath) {
         return c.text('Empty files cannot be uploaded\n', 400)
       }
 
@@ -522,8 +594,17 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
 
       return c.text(`${fileUrl}\n`, 200)
     } catch (err) {
-      if (err instanceof PayloadTooLargeError) {
+      if (err instanceof PayloadTooLargeError || err instanceof MultipartPayloadTooLargeError) {
         return c.text(`${err.message}\n`, 413)
+      }
+      if (err instanceof MultipartTruncatedError) {
+        console.warn(
+          `[upload] Multipart stream ended unexpectedly (received ${err.bytesReceived}/${expectedContentLength ?? '?'} bytes)`
+        )
+        return c.text(`${err.message}\n`, 400)
+      }
+      if (err instanceof MultipartBadRequestError || err instanceof MultipartAbortedError) {
+        return c.text(`${err.message}\n`, 400)
       }
       if (
         err instanceof Error &&
@@ -537,6 +618,10 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
       console.error('[upload] Error handling upload:', err)
       return c.text('Upload failed\n', 500)
     } finally {
+      const openWriteStream = writeStream as WriteStream | null
+      if (openWriteStream) {
+        await destroyWriteStream(openWriteStream)
+      }
       if (uploadId) {
         const current = uploadProgress.get(uploadId)
         if (current && current.done) {
@@ -645,6 +730,7 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
         chatId: record.tg_chat_id,
         messageId: record.tg_message_id,
         fileId: record.tg_file_id,
+        fileSize: record.size,
         offset,
         limit: length,
         signal: c.req.raw.signal,
