@@ -767,6 +767,30 @@ describe('TellShare Hono app', () => {
     expect(oversizeRes.status).toBe(413)
     expect(storage.objects.size).toBe(beforeObjs)
   })
+
+  it('returns 400 and leaves no orphaned records when multipart stream is truncated before closing boundary', async () => {
+    const boundary = '----TellShareTruncatedBoundary123'
+    const truncatedBody = [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="file"; filename="partial.bin"',
+      'Content-Type: application/octet-stream',
+      '',
+      'partial-payload-without-closing-boundary',
+    ].join('\r\n')
+
+    const res = await app.request('http://localhost:3000/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      },
+      body: truncatedBody,
+    })
+
+    expect(res.status).toBe(400)
+    expect(await res.text()).toContain('interrupted or truncated')
+    expect(db.getStats().count).toBe(0)
+    expect(storage.objects.size).toBe(0)
+  })
 })
 
 describe('ensureStorageChannel', () => {

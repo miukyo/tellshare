@@ -639,6 +639,13 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
     }
 
     const bodyReader = reqBody.getReader()
+    const rawContentLength = c.req.header('content-length')
+    const parsedContentLength = rawContentLength ? Number.parseInt(rawContentLength, 10) : NaN
+    const expectedContentLength =
+      Number.isFinite(parsedContentLength) && parsedContentLength >= 0
+        ? parsedContentLength
+        : undefined
+    let bytesReceived = 0
     let sawFile = false
     let urlValue = ''
     let filename = 'file'
@@ -656,6 +663,19 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
       bodyReader.cancel().catch(() => {})
       bb.destroy()
       wakePump?.()
+    }
+
+    const reqSignal = c.req.raw.signal
+    const onClientAbort = () => {
+      if (!busboyErr && !uploadErr) {
+        busboyErr = new BadRequestError('Upload aborted by client')
+      }
+      abortPump()
+    }
+    if (reqSignal?.aborted) {
+      onClientAbort()
+    } else {
+      reqSignal?.addEventListener('abort', onClientAbort, { once: true })
     }
 
     const reportProgress = uploadId
@@ -720,9 +740,16 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
         wakePump?.()
         resolve()
       })
-      bb.once('error', () => {
+      bb.once('error', (err: Error) => {
         if (!pumpAborted && !busboyErr) {
-          busboyErr = new BadRequestError('Invalid multipart/form-data request')
+          if (err?.message?.includes('Unexpected end of form')) {
+            console.warn(
+              `[upload] Multipart stream ended unexpectedly (received ${bytesReceived}/${expectedContentLength ?? '?'} bytes)`
+            )
+            busboyErr = new BadRequestError('Upload interrupted or truncated before completion')
+          } else {
+            busboyErr = new BadRequestError('Invalid multipart/form-data request')
+          }
         }
         wakePump?.()
         resolve()
@@ -756,6 +783,7 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
             break
           }
           if (pumpAborted) break
+          bytesReceived += value.byteLength
           if (!bb.write(value)) {
             await waitForDrain()
           }
@@ -772,8 +800,8 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
         await uploadPromise
       }
 
-      if (uploadErr) throw uploadErr
       if (busboyErr) throw busboyErr
+      if (uploadErr) throw uploadErr
 
       if (!uploadResult) {
         if (!urlValue) {
@@ -883,6 +911,7 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
       console.error('[upload] Error handling upload:', err)
       return c.text('Upload failed\n', 500)
     } finally {
+      reqSignal?.removeEventListener('abort', onClientAbort)
       if (uploadId) {
         const current = uploadProgress.get(uploadId)
         if (current && current.done) {

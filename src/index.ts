@@ -33,7 +33,7 @@ async function main(): Promise<void> {
     fetch: app.fetch,
     maxRequestBodySize:
       config.maxFileSize > 0 ? config.maxFileSize + 10 * 1024 * 1024 : Number.MAX_SAFE_INTEGER,
-    idleTimeout: 255,
+    idleTimeout: 0,
   })
 
   console.log(
