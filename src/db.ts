@@ -9,6 +9,9 @@ export interface FileRecord {
   mime_type: string
   size: number
   sha256: string
+  tg_chat_id: string
+  tg_message_id: number
+  tg_file_id: string | null
   enc_salt: string
   enc_iv: string
   mgmt_token_hash: string
@@ -17,16 +20,6 @@ export interface FileRecord {
 }
 
 export type NewFileRecord = Omit<FileRecord, 'downloads'>
-
-export interface FilePartRecord {
-  file_id: string
-  part_index: number
-  byte_offset: number
-  byte_length: number
-  tg_chat_id: string
-  tg_message_id: number
-  tg_file_id: string | null
-}
 
 export class FileDatabase {
   private readonly db: Database
@@ -50,6 +43,9 @@ export class FileDatabase {
         mime_type TEXT NOT NULL,
         size INTEGER NOT NULL,
         sha256 TEXT NOT NULL,
+        tg_chat_id TEXT NOT NULL,
+        tg_message_id INTEGER NOT NULL,
+        tg_file_id TEXT,
         enc_salt TEXT NOT NULL,
         enc_iv TEXT NOT NULL,
         mgmt_token_hash TEXT NOT NULL,
@@ -57,71 +53,40 @@ export class FileDatabase {
         downloads INTEGER NOT NULL DEFAULT 0
       );
 
-      CREATE TABLE IF NOT EXISTS file_parts (
-        file_id TEXT NOT NULL,
-        part_index INTEGER NOT NULL,
-        byte_offset INTEGER NOT NULL,
-        byte_length INTEGER NOT NULL,
-        tg_chat_id TEXT NOT NULL,
-        tg_message_id INTEGER NOT NULL,
-        tg_file_id TEXT,
-        PRIMARY KEY (file_id, part_index)
-      );
-
       CREATE INDEX IF NOT EXISTS idx_files_sha256 ON files(sha256);
-      CREATE INDEX IF NOT EXISTS idx_file_parts_tg_msg ON file_parts(tg_chat_id, tg_message_id);
+      CREATE INDEX IF NOT EXISTS idx_files_tg_msg ON files(tg_chat_id, tg_message_id);
     `)
   }
 
-  insertWithParts(record: NewFileRecord, parts: FilePartRecord[]): void {
-    const insertFile = this.db.prepare(`
+  insert(record: NewFileRecord): void {
+    const stmt = this.db.prepare(`
       INSERT INTO files (
         id, ext, filename, mime_type, size, sha256,
+        tg_chat_id, tg_message_id, tg_file_id,
         enc_salt, enc_iv,
         mgmt_token_hash, created_at, downloads
       ) VALUES (
         $id, $ext, $filename, $mime_type, $size, $sha256,
+        $tg_chat_id, $tg_message_id, $tg_file_id,
         $enc_salt, $enc_iv,
         $mgmt_token_hash, $created_at, 0
       )
     `)
-    const insertPart = this.db.prepare(`
-      INSERT INTO file_parts (
-        file_id, part_index, byte_offset, byte_length,
-        tg_chat_id, tg_message_id, tg_file_id
-      ) VALUES (
-        $file_id, $part_index, $byte_offset, $byte_length,
-        $tg_chat_id, $tg_message_id, $tg_file_id
-      )
-    `)
-
-    const tx = this.db.transaction(() => {
-      insertFile.run({
-        $id: record.id,
-        $ext: record.ext,
-        $filename: record.filename,
-        $mime_type: record.mime_type,
-        $size: record.size,
-        $sha256: record.sha256,
-        $enc_salt: record.enc_salt,
-        $enc_iv: record.enc_iv,
-        $mgmt_token_hash: record.mgmt_token_hash,
-        $created_at: record.created_at,
-      })
-
-      for (const part of parts) {
-        insertPart.run({
-          $file_id: part.file_id,
-          $part_index: part.part_index,
-          $byte_offset: part.byte_offset,
-          $byte_length: part.byte_length,
-          $tg_chat_id: part.tg_chat_id,
-          $tg_message_id: part.tg_message_id,
-          $tg_file_id: part.tg_file_id,
-        })
-      }
+    stmt.run({
+      $id: record.id,
+      $ext: record.ext,
+      $filename: record.filename,
+      $mime_type: record.mime_type,
+      $size: record.size,
+      $sha256: record.sha256,
+      $tg_chat_id: record.tg_chat_id,
+      $tg_message_id: record.tg_message_id,
+      $tg_file_id: record.tg_file_id,
+      $enc_salt: record.enc_salt,
+      $enc_iv: record.enc_iv,
+      $mgmt_token_hash: record.mgmt_token_hash,
+      $created_at: record.created_at,
     })
-    tx()
   }
 
   getById(id: string): FileRecord | null {
@@ -129,40 +94,28 @@ export class FileDatabase {
     return (stmt.get(id) as FileRecord | null) ?? null
   }
 
-  getParts(fileId: string): FilePartRecord[] {
-    const stmt = this.db.prepare(`
-      SELECT * FROM file_parts
-      WHERE file_id = ?
-      ORDER BY part_index ASC
-    `)
-    return stmt.all(fileId) as FilePartRecord[]
-  }
-
   findExistingBySha256(
     sha256: string
-  ): { enc_salt: string; enc_iv: string; parts: FilePartRecord[] } | null {
+  ): Pick<FileRecord, 'tg_chat_id' | 'tg_message_id' | 'tg_file_id' | 'enc_salt' | 'enc_iv'> | null {
     const stmt = this.db.prepare(`
-      SELECT id, enc_salt, enc_iv
+      SELECT tg_chat_id, tg_message_id, tg_file_id, enc_salt, enc_iv
       FROM files
       WHERE sha256 = ? AND enc_salt != '' AND enc_iv != ''
       ORDER BY created_at DESC
       LIMIT 1
     `)
-    const row = stmt.get(sha256) as Pick<FileRecord, 'id' | 'enc_salt' | 'enc_iv'> | null
-    if (!row) return null
-    const parts = this.getParts(row.id)
-    if (parts.length === 0) return null
-    return {
-      enc_salt: row.enc_salt,
-      enc_iv: row.enc_iv,
-      parts,
-    }
+    return (
+      (stmt.get(sha256) as Pick<
+        FileRecord,
+        'tg_chat_id' | 'tg_message_id' | 'tg_file_id' | 'enc_salt' | 'enc_iv'
+      > | null) ?? null
+    )
   }
 
   countByTelegramMessage(tgChatId: string, tgMessageId: number): number {
     const stmt = this.db.prepare(`
       SELECT COUNT(*) AS cnt
-      FROM file_parts
+      FROM files
       WHERE tg_chat_id = ? AND tg_message_id = ?
     `)
     const row = stmt.get(tgChatId, tgMessageId) as { cnt: number } | null
@@ -171,7 +124,7 @@ export class FileDatabase {
 
   updateTgFileId(tgChatId: string, tgMessageId: number, tgFileId: string): void {
     const stmt = this.db.prepare(`
-      UPDATE file_parts
+      UPDATE files
       SET tg_file_id = ?
       WHERE tg_chat_id = ? AND tg_message_id = ?
     `)
@@ -184,14 +137,9 @@ export class FileDatabase {
   }
 
   deleteById(id: string): boolean {
-    const delParts = this.db.prepare('DELETE FROM file_parts WHERE file_id = ?')
-    const delFile = this.db.prepare('DELETE FROM files WHERE id = ?')
-    const tx = this.db.transaction(() => {
-      delParts.run(id)
-      const info = delFile.run(id)
-      return info.changes > 0
-    })
-    return tx()
+    const stmt = this.db.prepare('DELETE FROM files WHERE id = ?')
+    const info = stmt.run(id)
+    return info.changes > 0
   }
 
   getStats(): { count: number; totalBytes: number } {

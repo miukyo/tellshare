@@ -11,7 +11,6 @@ export interface AppConfig {
   storageChannelName: string
   dataDir: string
   maxFileSize: number
-  partSize: number
   allowUrlUpload: boolean
   encryptionKey?: Buffer
 }
@@ -58,11 +57,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const storageChannelName = (env.STORAGE_CHANNEL_NAME ?? 'tellshare files').trim() || 'tellshare files'
   const dataDir = (env.DATA_DIR ?? './data').trim() || './data'
 
-  const maxFileSize = parseIntEnv(env.MAX_FILE_SIZE, 0, 'MAX_FILE_SIZE')
-  const partSize = parseIntEnv(env.PART_SIZE, 512 * 1024 * 1024, 'PART_SIZE')
-  if (partSize <= 0 || partSize > 1_900 * 1024 * 1024) {
-    throw new Error('PART_SIZE must be between 1 byte and 1900 MiB (1992294400 bytes)')
-  }
+  const maxFileSize = parseIntEnv(env.MAX_FILE_SIZE, 512 * 1024 * 1024, 'MAX_FILE_SIZE')
   const allowUrlUpload = parseBooleanEnv(env.ALLOW_URL_UPLOAD, true)
   const rawEncKey = (env.ENCRYPTION_KEY ?? '').trim()
   const encryptionKey = rawEncKey ? parseEncryptionKey(rawEncKey) : undefined
@@ -78,7 +73,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     storageChannelName,
     dataDir,
     maxFileSize,
-    partSize,
     allowUrlUpload,
     encryptionKey,
   }

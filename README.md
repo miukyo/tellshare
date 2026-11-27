@@ -53,14 +53,13 @@ curl -F 'token=YOUR_TOKEN' -F 'delete=' https://your-host/<id>
 | `STORAGE_CHAT_ID` | — | Optional chat/channel ID or `@username` (auto-creates `"tellshare files"` if empty) |
 | `STORAGE_CHANNEL_NAME` | `tellshare files` | Channel name for automatic creation/lookup |
 | `DATA_DIR` | `./data` | Directory for `tellshare.db` and `telegram.session` |
-| `MAX_FILE_SIZE` | `0` | Max upload size in bytes (`0` = unlimited) |
-| `PART_SIZE` | `536870912` | Part split size in bytes for >2 GB streaming uploads (default 512 MiB) |
+| `MAX_FILE_SIZE` | `536870912` | Max upload size in bytes (512 MiB) |
 | `ALLOW_URL_UPLOAD` | `true` | Enable/disable `url=` uploads |
 
 ## Legal & Privacy Policy
 
 - **No accounts or tracking:** TellShare does not use accounts, cookies, analytics, or tracking.
-- **Stored metadata:** Only file ID, filename, MIME type, size, plaintext SHA-256, per-file encryption salt/IV, Telegram message references, hashed `X-Token`, creation timestamp, and download count are stored in `DATA_DIR/tellshare.db`.
+- **Stored metadata:** Only file ID, filename, MIME type, size, plaintext SHA-256, per-file encryption salt/IV, Telegram message reference, hashed `X-Token`, creation timestamp, and download count are stored in `DATA_DIR/tellshare.db`.
 - **Encryption & access:** Files are encrypted server-side with AES-256-CTR before upload to Telegram under random opaque `.bin` filenames unrelated to the share URL. Anyone with the share URL can download the file; `X-Token` grants deletion rights. Back up `ENCRYPTION_KEY` and `tellshare.db` — files cannot be decrypted without them.
 - **Operator access & trust:** Because encryption is server-side (not zero-knowledge), the server operator technically has access to stored metadata and can decrypt files if required (for example, for abuse moderation or legal compliance). The operator does not actively browse or share user files; for sensitive data, encrypt files client-side before uploading (e.g., `age`, `gpg`, or an encrypted archive). TellShare is open-source at https://github.com/miukyo/tellshare — you can audit the code or self-host your own instance.
 - **Acceptable use & disclaimer:** Do not upload illegal, copyrighted, or malicious content. Software and hosted instances are provided "as-is" without warranty, operators may remove files at any time, and backend storage is subject to Telegram's Terms of Service.

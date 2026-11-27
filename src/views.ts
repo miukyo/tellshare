@@ -25,7 +25,7 @@ const LEGAL_PRIVACY_POLICY = [
   '----------------------',
   '- No accounts or tracking: TellShare does not use accounts, cookies, analytics, or tracking.',
   '- Stored metadata: Only file ID, filename, MIME type, size, plaintext SHA-256, per-file encryption',
-  '  salt/IV, Telegram message references, hashed X-Token, creation timestamp, and download count are',
+  '  salt/IV, Telegram message reference, hashed X-Token, creation timestamp, and download count are',
   '  stored in DATA_DIR/tellshare.db.',
   '- Encryption & access: Files are encrypted server-side with AES-256-CTR before upload to Telegram',
   '  under random opaque .bin filenames unrelated to the share URL. Anyone with the share URL can',
@@ -47,7 +47,7 @@ export function renderPlainHelp(
   stats: { count: number; totalBytes: number },
   baseUrl: string
 ): string {
-  const maxSize = config.maxFileSize > 0 ? formatBytes(config.maxFileSize) : 'unlimited'
+  const maxSize = formatBytes(config.maxFileSize)
   const stored = formatBytes(stats.totalBytes)
   const url = baseUrl
 
@@ -312,9 +312,7 @@ export function renderWebUi(
 ): string {
   const safeBaseUrl = escapeHtml(baseUrl)
   const originTag = `<span class="origin">${safeBaseUrl}</span>`
-  const maxSizeLabel = escapeHtml(
-    config.maxFileSize > 0 ? formatBytes(config.maxFileSize) : 'unlimited'
-  )
+  const maxSizeLabel = escapeHtml(formatBytes(config.maxFileSize))
   const storedLabel = escapeHtml(formatBytes(stats.totalBytes))
   const urlUploadStatus = config.allowUrlUpload ? 'enabled' : 'disabled'
 
@@ -483,9 +481,6 @@ File: <input id="fileInput" type="file" name="file">${urlFieldLine}
     xhr.open('POST', '/');
     xhr.setRequestHeader('Accept', 'application/json');
     xhr.setRequestHeader('X-Upload-Id', uploadId);
-    if (file) {
-      xhr.setRequestHeader('X-File-Size', String(file.size));
-    }
 
     xhr.upload.addEventListener('progress', function (ev) {
       if (ev.lengthComputable && ev.total > 0) {
