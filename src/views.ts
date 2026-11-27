@@ -28,7 +28,7 @@ export function renderPlainHelp(
   const url = baseUrl
 
   return `${ASCII_BANNER}
-TELLSHARE - file host with Telegram storage backend
+TELLSHARE (0x0.st-compatible file host backed by Telegram MTProto)
 ==================================================================
 
 USAGE
@@ -61,6 +61,15 @@ Retention:       unlimited
 URL uploads:     ${config.allowUrlUpload ? 'enabled' : 'disabled'}
 Media embeds:    enabled (Discord, Telegram, Twitter/X, Slack)
 Active files:    ${stats.count} (${stored})
+
+LEGAL & PRIVACY
+---------------
+- No accounts, cookies, or tracking. Do not upload illegal, copyrighted,
+  or malicious content.
+- Files are AES-256-CTR encrypted before storage on Telegram; SQLite stores
+  only file metadata, encryption parameters, and hashed delete tokens.
+- Anyone with a file URL can download it; save X-Token to delete uploads.
+- Provided "as-is" without warranty and subject to Telegram ToS.
 `
 }
 
@@ -107,17 +116,170 @@ export function renderMediaEmbedHtml(opts: {
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>${title}</title>
-  <meta property="og:site_name" content="TellShare">
-  <meta property="og:title" content="${title}">
-  <meta property="og:description" content="${mimeType} (${sizeLabel})">
   <meta property="og:url" content="${pageUrl}">
 ${mediaTags}
-  <meta name="theme-color" content="#38bdf8">
   <meta http-equiv="refresh" content="0;url=${rawUrl}">
 </head>
 <body>
 <pre><a href="${rawUrl}">${title}</a> (${sizeLabel})</pre>
+</body>
+</html>
+`
+}
+
+export function renderSetupUi(baseUrl: string): string {
+  const safeBaseUrl = escapeHtml(baseUrl)
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TellShare Setup</title>
+</head>
+<body>
+<pre>${escapeHtml(ASCII_BANNER)}
+FIRST-TIME TELEGRAM SETUP
+=========================
+Sign in to your Telegram account to auto-create/use the "tellshare files" storage channel.
+Server: <span class="origin">${safeBaseUrl}</span></pre>
+
+<pre>OPTION 1: QR CODE LOGIN (Recommended)
+-------------------------------------
+Open Telegram on your phone -&gt; Settings -&gt; Devices -&gt; Link Desktop Device.
+
+<button id="qrBtn" type="button">Generate QR Code</button></pre>
+<pre id="qrBox"></pre>
+
+<pre>OPTION 2: PHONE NUMBER LOGIN
+----------------------------
+Phone: <input id="phoneInput" type="tel" placeholder="+1234567890" size="24"> <button id="sendCodeBtn" type="button">Send Code</button>
+Code:  <input id="codeInput" type="text" placeholder="12345" size="12"> <button id="verifyCodeBtn" type="button">Verify Code</button><span id="twoFaSection" hidden>
+2FA:   <input id="passInput" type="password" placeholder="2FA password" size="24"> <button id="verifyPassBtn" type="button">Submit 2FA</button></span></pre>
+
+<pre id="setupStatus">Checking status...</pre>
+
+<script>
+(function () {
+  if (window.location && window.location.origin && window.location.origin !== 'null') {
+    document.querySelectorAll('.origin').forEach(function (el) {
+      el.textContent = window.location.origin;
+    });
+  }
+
+  var qrBtn = document.getElementById('qrBtn');
+  var qrBox = document.getElementById('qrBox');
+  var phoneInput = document.getElementById('phoneInput');
+  var sendCodeBtn = document.getElementById('sendCodeBtn');
+  var codeInput = document.getElementById('codeInput');
+  var verifyCodeBtn = document.getElementById('verifyCodeBtn');
+  var twoFaSection = document.getElementById('twoFaSection');
+  var passInput = document.getElementById('passInput');
+  var verifyPassBtn = document.getElementById('verifyPassBtn');
+  var statusEl = document.getElementById('setupStatus');
+  var pollTimer = null;
+
+  function stopPolling() {
+    if (pollTimer !== null) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  function applyStatus(data) {
+    if (!data) return;
+
+    if (data.connected || data.state === 'connected') {
+      stopPolling();
+      qrBox.textContent = '';
+      statusEl.textContent = 'Connected! Redirecting to TellShare...';
+      setTimeout(function () { window.location.reload(); }, 600);
+      return;
+    }
+
+    if (data.qrAscii) {
+      qrBox.textContent = data.qrAscii;
+    } else if (data.state !== 'qr_pending' && data.state !== 'qr_scanned') {
+      qrBox.textContent = '';
+    }
+
+    twoFaSection.hidden = data.state !== 'password_required';
+
+    if (data.error) {
+      statusEl.textContent = 'Error: ' + data.error;
+    } else if (data.state === 'qr_pending') {
+      statusEl.textContent = 'Waiting for QR scan in Telegram app...';
+      startPolling();
+    } else if (data.state === 'qr_scanned') {
+      statusEl.textContent = 'QR scanned! Finalizing login...';
+      startPolling();
+    } else if (data.state === 'code_sent') {
+      statusEl.textContent = 'Verification code sent. Enter the code above and click Verify Code.';
+    } else if (data.state === 'password_required') {
+      statusEl.textContent = 'Two-step verification enabled. Enter your 2FA password above.';
+      stopPolling();
+    } else {
+      statusEl.textContent = 'Ready. Choose QR code login or phone login above.';
+    }
+  }
+
+  function startPolling() {
+    if (pollTimer !== null) return;
+    pollTimer = setInterval(function () {
+      fetch('/setup/status')
+        .then(function (r) { return r.json(); })
+        .then(applyStatus)
+        .catch(function () {});
+    }, 1500);
+  }
+
+  function postJson(url, body, btn) {
+    if (btn) btn.disabled = true;
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {})
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (btn) btn.disabled = false;
+        applyStatus(data);
+      })
+      .catch(function () {
+        if (btn) btn.disabled = false;
+        statusEl.textContent = 'Network error communicating with server.';
+      });
+  }
+
+  qrBtn.addEventListener('click', function () {
+    statusEl.textContent = 'Generating QR code...';
+    postJson('/setup/qr', {}, qrBtn);
+  });
+
+  sendCodeBtn.addEventListener('click', function () {
+    stopPolling();
+    statusEl.textContent = 'Sending verification code...';
+    postJson('/setup/phone', { phone: phoneInput.value }, sendCodeBtn);
+  });
+
+  verifyCodeBtn.addEventListener('click', function () {
+    statusEl.textContent = 'Verifying code...';
+    postJson('/setup/code', { code: codeInput.value }, verifyCodeBtn);
+  });
+
+  verifyPassBtn.addEventListener('click', function () {
+    statusEl.textContent = 'Checking 2FA password...';
+    postJson('/setup/password', { password: passInput.value }, verifyPassBtn);
+  });
+
+  fetch('/setup/status')
+    .then(function (r) { return r.json(); })
+    .then(applyStatus)
+    .catch(function () {
+      statusEl.textContent = 'Ready. Choose QR code login or phone login above.';
+    });
+})();
+</script>
 </body>
 </html>
 `
@@ -147,7 +309,7 @@ export function renderWebUi(
 </head>
 <body>
 <pre>${escapeHtml(ASCII_BANNER)}
-TELLSHARE - file host with Telegram storage backend
+TELLSHARE — 0x0.st-compatible file host (Telegram MTProto storage)
 =====================================================================
 Active files: ${stats.count} (${storedLabel}) | Max size: ${maxSizeLabel} | Retention: unlimited | URL uploads: ${urlUploadStatus}</pre>
 
@@ -156,7 +318,7 @@ Active files: ${stats.count} (${storedLabel}) | Max size: ${maxSizeLabel} | Rete
 ------
 File: <input id="fileInput" type="file" name="file">${urlFieldLine}
 
-<button id="submitBtn" type="submit">Upload</button> <progress id="progress" value="0" max="100" hidden></progress></pre>
+<button id="submitBtn" type="submit">Upload</button></pre>
 </form>
 
 <pre id="output"></pre>
@@ -187,6 +349,17 @@ File: <input id="fileInput" type="file" name="file">${urlFieldLine}
 6. Health check:
    curl ${originTag}/health</pre>
 
+<pre>LEGAL &amp; PRIVACY POLICY
+----------------------
+- Privacy: No user accounts, cookies, analytics, or tracking. Local SQLite stores
+  only file metadata (ID, filename, MIME, size, SHA-256, encryption salt/IV,
+  Telegram message reference, hashed X-Token, timestamps, download count).
+- Encryption &amp; Access: Files are AES-256-CTR encrypted before upload to Telegram.
+  Anyone with the share URL can download the decrypted file; use X-Token to delete.
+- Acceptable Use &amp; Warranty: Do not upload illegal, copyrighted, or malicious files.
+  Provided "as-is" without warranty; operators may remove content at any time, and
+  storage is subject to Telegram's Terms of Service.</pre>
+
 <script>
 (function () {
   if (window.location && window.location.origin && window.location.origin !== 'null') {
@@ -199,7 +372,6 @@ File: <input id="fileInput" type="file" name="file">${urlFieldLine}
   var fileInput = document.getElementById('fileInput');
   var urlInput = document.getElementById('urlInput');
   var submitBtn = document.getElementById('submitBtn');
-  var progress = document.getElementById('progress');
   var output = document.getElementById('output');
 
   function fmtBytes(n) {
@@ -217,9 +389,11 @@ File: <input id="fileInput" type="file" name="file">${urlFieldLine}
     return '[' + bar + ']';
   }
 
-  function resetProgress() {
-    progress.hidden = true;
-    progress.value = 0;
+  function newUploadId() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      return window.crypto.randomUUID();
+    }
+    return String(Date.now()) + '-' + Math.random().toString(36).slice(2);
   }
 
   if (fileInput && urlInput) {
@@ -257,31 +431,61 @@ File: <input id="fileInput" type="file" name="file">${urlFieldLine}
       fd.append('url', url);
     }
 
+    var uploadId = newUploadId();
+    var pollTimer = null;
+
+    function stopPoll() {
+      if (pollTimer !== null) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    function startTelegramPoll() {
+      if (pollTimer !== null) return;
+      pollTimer = setInterval(function () {
+        fetch('/upload-progress/' + encodeURIComponent(uploadId))
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (p) {
+            if (!p || !p.total) return;
+            var tgPct = Math.min(100, Math.round((p.uploaded / p.total) * 100));
+            var totalPct = p.done ? 100 : Math.min(99, 50 + Math.round(tgPct * 0.5));
+            output.textContent =
+              asciiBar(totalPct) + ' ' + totalPct + '% (' +
+              fmtBytes(p.uploaded) + ' / ' + fmtBytes(p.total) + ' -> Telegram)';
+          })
+          .catch(function () {});
+      }, 350);
+    }
+
     submitBtn.disabled = true;
-    progress.hidden = false;
-    progress.value = 0;
     output.textContent = asciiBar(0) + ' 0%';
 
     var xhr = new XMLHttpRequest();
     xhr.open('POST', '/');
     xhr.setRequestHeader('Accept', 'application/json');
+    xhr.setRequestHeader('X-Upload-Id', uploadId);
 
     xhr.upload.addEventListener('progress', function (ev) {
       if (ev.lengthComputable && ev.total > 0) {
-        var pct = Math.round((ev.loaded / ev.total) * 100);
-        if (pct >= 100) {
-          progress.removeAttribute('value');
-          output.textContent = asciiBar(100) + ' 100% (' + fmtBytes(ev.total) + ') - Saving to Telegram...';
-        } else {
-          progress.value = pct;
-          output.textContent = asciiBar(pct) + ' ' + pct + '% (' + fmtBytes(ev.loaded) + ' / ' + fmtBytes(ev.total) + ')';
+        var totalPct = Math.min(50, Math.round((ev.loaded / ev.total) * 50));
+        output.textContent =
+          asciiBar(totalPct) + ' ' + totalPct + '% (' +
+          fmtBytes(ev.loaded) + ' / ' + fmtBytes(ev.total) + ')';
+        if (ev.loaded >= ev.total) {
+          startTelegramPoll();
         }
       }
     });
 
+    xhr.upload.addEventListener('load', function () {
+      output.textContent = asciiBar(50) + ' 50% (Saving to Telegram...)';
+      startTelegramPoll();
+    });
+
     xhr.addEventListener('load', function () {
+      stopPoll();
       submitBtn.disabled = false;
-      resetProgress();
       if (xhr.status < 200 || xhr.status >= 300) {
         output.textContent = 'Error (' + xhr.status + '): ' + (xhr.responseText || 'Upload failed');
         return;
@@ -338,8 +542,8 @@ File: <input id="fileInput" type="file" name="file">${urlFieldLine}
     });
 
     xhr.addEventListener('error', function () {
+      stopPoll();
       submitBtn.disabled = false;
-      resetProgress();
       output.textContent = 'Network error while uploading.';
     });
 

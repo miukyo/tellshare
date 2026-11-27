@@ -1,24 +1,31 @@
 import { mkdirSync } from 'node:fs'
 import path from 'node:path'
 import { createApp } from './app'
-import { loadConfig } from './config'
+import { assertEncryptionConfig, loadConfig } from './config'
 import { FileDatabase } from './db'
 import { TelegramStorage } from './telegram'
 
 async function main(): Promise<void> {
   const config = loadConfig()
+  assertEncryptionConfig(config)
   mkdirSync(config.dataDir, { recursive: true })
 
   const db = new FileDatabase(path.join(config.dataDir, 'tellshare.db'))
   const storage = new TelegramStorage(config)
 
   console.log('[tellshare] Connecting to Telegram MTProto...')
-  await storage.start()
-  console.log(
-    `[tellshare] Telegram connected. Storage target: ${String(storage.getStorageChatId())}`
-  )
+  const ready = await storage.tryStart()
+  if (ready) {
+    console.log(
+      `[tellshare] Telegram connected. Storage target: ${String(storage.getStorageChatId())}`
+    )
+  } else {
+    console.log(
+      `[tellshare] Telegram session not authorized yet. Open http://${config.host === '0.0.0.0' ? 'localhost' : config.host}:${config.port} to sign in via QR code or phone.`
+    )
+  }
 
-  const app = createApp({ db, storage, config })
+  const app = createApp({ db, storage, setup: storage, config })
 
   const server = Bun.serve({
     port: config.port,

@@ -1,12 +1,17 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { Cipheriv, createHash, randomUUID } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
 import { unlink } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { Context, Hono } from 'hono'
-import { AppConfig } from './config'
+import { AppConfig, assertEncryptionConfig } from './config'
+import {
+  createDecryptStream,
+  createFileCipher,
+  generateFileEncryptionParams,
+} from './crypto'
 import { FileDatabase, FileRecord } from './db'
-import { StorageBackend, TelegramObjectNotFoundError } from './telegram'
+import { SetupBackend, StorageBackend, TelegramObjectNotFoundError } from './telegram'
 import {
   generateId,
   generateManagementToken,
@@ -22,11 +27,12 @@ import {
   validateRemoteUrl,
   verifyToken,
 } from './utils'
-import { renderMediaEmbedHtml, renderPlainHelp, renderWebUi } from './views'
+import { renderMediaEmbedHtml, renderPlainHelp, renderSetupUi, renderWebUi } from './views'
 
 export interface CreateAppDeps {
   db: FileDatabase
   storage: StorageBackend
+  setup?: SetupBackend
   config: AppConfig
 }
 
@@ -110,13 +116,32 @@ function extractFilenameFromHeaders(contentDisposition: string | null, url: URL)
 
 async function spoolStreamToTempFile(
   stream: ReadableStream<Uint8Array>,
-  maxFileSize: number
+  maxFileSize: number,
+  cipher: Cipheriv
 ): Promise<{ tempPath: string; size: number; sha256: string }> {
   const tempPath = path.join(os.tmpdir(), `tellshare-${randomUUID()}`)
   const hasher = createHash('sha256')
   const writeStream = createWriteStream(tempPath, { flags: 'wx' })
   const reader = stream.getReader()
   let totalSize = 0
+
+  const writeChunk = async (buf: Uint8Array) => {
+    if (buf.byteLength === 0) return
+    if (!writeStream.write(buf)) {
+      await new Promise<void>((resolve, reject) => {
+        const onDrain = () => {
+          writeStream.off('error', onError)
+          resolve()
+        }
+        const onError = (err: Error) => {
+          writeStream.off('drain', onDrain)
+          reject(err)
+        }
+        writeStream.once('drain', onDrain)
+        writeStream.once('error', onError)
+      })
+    }
+  }
 
   try {
     while (true) {
@@ -127,21 +152,10 @@ async function spoolStreamToTempFile(
         throw new PayloadTooLargeError(`File exceeds max size of ${maxFileSize} bytes`)
       }
       hasher.update(value)
-      if (!writeStream.write(value)) {
-        await new Promise<void>((resolve, reject) => {
-          const onDrain = () => {
-            writeStream.off('error', onError)
-            resolve()
-          }
-          const onError = (err: Error) => {
-            writeStream.off('drain', onDrain)
-            reject(err)
-          }
-          writeStream.once('drain', onDrain)
-          writeStream.once('error', onError)
-        })
-      }
+      await writeChunk(cipher.update(value))
     }
+
+    await writeChunk(cipher.final())
 
     await new Promise<void>((resolve, reject) => {
       const onFinish = () => {
@@ -172,7 +186,8 @@ async function spoolStreamToTempFile(
 
 async function fetchRemoteUrlToTempFile(
   rawUrl: string,
-  maxFileSize: number
+  maxFileSize: number,
+  cipher: Cipheriv
 ): Promise<{
   tempPath: string
   size: number
@@ -225,7 +240,7 @@ async function fetchRemoteUrlToTempFile(
     }
   }
 
-  const spooled = await spoolStreamToTempFile(response.body, maxFileSize)
+  const spooled = await spoolStreamToTempFile(response.body, maxFileSize, cipher)
   const filename = extractFilenameFromHeaders(
     response.headers.get('content-disposition'),
     currentUrl
@@ -255,8 +270,10 @@ async function deleteRecordAndCleanupTelegram(
   db.deleteById(record.id)
 }
 
-export function createApp({ db, storage, config }: CreateAppDeps): Hono {
+export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
+  const encryptionKey = assertEncryptionConfig(config)
   const app = new Hono()
+  const uploadProgress = new Map<string, { uploaded: number; total: number; done: boolean }>()
 
   app.get('/health', (c) => {
     return c.json({
@@ -266,10 +283,74 @@ export function createApp({ db, storage, config }: CreateAppDeps): Hono {
     })
   })
 
+  app.get('/upload-progress/:uploadId', (c) => {
+    const uploadId = c.req.param('uploadId')
+    const entry = uploadProgress.get(uploadId)
+    if (!entry) {
+      return c.json({ error: 'Not found' }, 404)
+    }
+    return c.json(entry)
+  })
+
+  const guardSetup = (c: Context) => {
+    if (!setup) {
+      return c.json({ error: 'Setup not available' }, 404)
+    }
+    if (storage.isConnected()) {
+      return c.json({ error: 'Already configured' }, 403)
+    }
+    return null
+  }
+
+  app.get('/setup/status', (c) => {
+    const blocked = guardSetup(c)
+    if (blocked) return blocked
+    return c.json(setup!.getSetupStatus())
+  })
+
+  app.post('/setup/qr', async (c) => {
+    const blocked = guardSetup(c)
+    if (blocked) return blocked
+    return c.json(await setup!.startQrLogin())
+  })
+
+  app.post('/setup/phone', async (c) => {
+    const blocked = guardSetup(c)
+    if (blocked) return blocked
+    const body = (await c.req.json().catch(() => ({}))) as { phone?: string }
+    return c.json(await setup!.sendPhoneCode(typeof body.phone === 'string' ? body.phone : ''))
+  })
+
+  app.post('/setup/code', async (c) => {
+    const blocked = guardSetup(c)
+    if (blocked) return blocked
+    const body = (await c.req.json().catch(() => ({}))) as { code?: string }
+    return c.json(await setup!.submitPhoneCode(typeof body.code === 'string' ? body.code : ''))
+  })
+
+  app.post('/setup/password', async (c) => {
+    const blocked = guardSetup(c)
+    if (blocked) return blocked
+    const body = (await c.req.json().catch(() => ({}))) as { password?: string }
+    return c.json(
+      await setup!.submitPassword(typeof body.password === 'string' ? body.password : '')
+    )
+  })
+
   app.get('/', (c) => {
-    const stats = db.getStats()
     const baseUrl = resolveBaseUrl(c, config)
-    if (prefersHtml(c.req.header('accept'), c.req.header('user-agent'))) {
+    const isHtml = prefersHtml(c.req.header('accept'), c.req.header('user-agent'))
+    if (!storage.isConnected() && setup) {
+      if (isHtml) {
+        return c.html(renderSetupUi(baseUrl))
+      }
+      return c.text(
+        `TellShare setup required. Open ${baseUrl} in a browser or run \`bun run login\`.\n`,
+        503
+      )
+    }
+    const stats = db.getStats()
+    if (isHtml) {
       return c.html(renderWebUi(config, stats, baseUrl))
     }
     return c.text(renderPlainHelp(config, stats, baseUrl), 200, {
@@ -278,6 +359,10 @@ export function createApp({ db, storage, config }: CreateAppDeps): Hono {
   })
 
   app.post('/', async (c) => {
+    if (!storage.isConnected()) {
+      return c.text('Telegram not configured yet. Complete setup at /\n', 503)
+    }
+
     let formData: FormData
     try {
       formData = await c.req.raw.formData()
@@ -300,6 +385,10 @@ export function createApp({ db, storage, config }: CreateAppDeps): Hono {
     }
 
     const nowMs = Date.now()
+    const uploadId = (c.req.header('x-upload-id') || c.req.query('uploadId') || '').trim()
+    if (uploadId) {
+      uploadProgress.set(uploadId, { uploaded: 0, total: 0, done: false })
+    }
 
     let tempPath: string | null = null
     let filename = 'file'
@@ -307,20 +396,27 @@ export function createApp({ db, storage, config }: CreateAppDeps): Hono {
     let size = 0
     let sha256 = ''
 
+    const { salt: newSalt, iv: newIv } = generateFileEncryptionParams()
+    const cipher = createFileCipher(encryptionKey, newSalt, newIv)
+
     try {
       if (hasFile) {
         const uploaded = fileEntry as File
         if (uploaded.size > config.maxFileSize) {
           return c.text(`File exceeds max size of ${config.maxFileSize} bytes\n`, 413)
         }
-        const spooled = await spoolStreamToTempFile(uploaded.stream(), config.maxFileSize)
+        const spooled = await spoolStreamToTempFile(uploaded.stream(), config.maxFileSize, cipher)
         tempPath = spooled.tempPath
         size = spooled.size
         sha256 = spooled.sha256
         filename = sanitizeFilename(uploaded.name || 'file')
         mimeType = inferMimeType(filename, uploaded.type)
       } else {
-        const remote = await fetchRemoteUrlToTempFile(urlEntry as string, config.maxFileSize)
+        const remote = await fetchRemoteUrlToTempFile(
+          urlEntry as string,
+          config.maxFileSize,
+          cipher
+        )
         tempPath = remote.tempPath
         size = remote.size
         sha256 = remote.sha256
@@ -330,6 +426,10 @@ export function createApp({ db, storage, config }: CreateAppDeps): Hono {
 
       if (size === 0) {
         return c.text('Empty files cannot be uploaded\n', 400)
+      }
+
+      if (uploadId) {
+        uploadProgress.set(uploadId, { uploaded: 0, total: size, done: false })
       }
 
       let id = generateId()
@@ -344,27 +444,48 @@ export function createApp({ db, storage, config }: CreateAppDeps): Hono {
       const mgmtToken = generateManagementToken()
       const mgmtTokenHash = hashToken(mgmtToken)
 
-      // Reuse existing Telegram message when identical content is already stored.
+      // Reuse existing encrypted Telegram message when identical plaintext is already stored.
       const existing = db.findExistingBySha256(sha256)
       let tgChatId: string
       let tgMessageId: number
       let tgFileId: string | null
+      let encSalt: string
+      let encIv: string
 
       if (existing) {
         tgChatId = existing.tg_chat_id
         tgMessageId = existing.tg_message_id
         tgFileId = existing.tg_file_id
+        encSalt = existing.enc_salt
+        encIv = existing.enc_iv
+        if (uploadId) {
+          uploadProgress.set(uploadId, { uploaded: size, total: size, done: true })
+        }
       } else {
+        encSalt = newSalt
+        encIv = newIv
         const tgObj = await storage.uploadFile({
           filePath: tempPath,
-          filename,
-          mimeType,
+          filename: `${id}.bin`,
+          mimeType: 'application/octet-stream',
           size,
-          caption: `${id}${ext ? `.${ext}` : ''} | ${filename}`,
+          caption: id,
+          onProgress: uploadId
+            ? (uploaded, total) => {
+                uploadProgress.set(uploadId, {
+                  uploaded,
+                  total: total > 0 ? total : size,
+                  done: false,
+                })
+              }
+            : undefined,
         })
         tgChatId = tgObj.chatId
         tgMessageId = tgObj.messageId
         tgFileId = tgObj.fileId
+        if (uploadId) {
+          uploadProgress.set(uploadId, { uploaded: size, total: size, done: true })
+        }
       }
 
       db.insert({
@@ -377,6 +498,8 @@ export function createApp({ db, storage, config }: CreateAppDeps): Hono {
         tg_chat_id: tgChatId,
         tg_message_id: tgMessageId,
         tg_file_id: tgFileId,
+        enc_salt: encSalt,
+        enc_iv: encIv,
         mgmt_token_hash: mgmtTokenHash,
         created_at: nowMs,
       })
@@ -413,6 +536,16 @@ export function createApp({ db, storage, config }: CreateAppDeps): Hono {
       console.error('[upload] Error handling upload:', err)
       return c.text('Upload failed\n', 500)
     } finally {
+      if (uploadId) {
+        const current = uploadProgress.get(uploadId)
+        if (current && current.done) {
+          setTimeout(() => {
+            uploadProgress.delete(uploadId)
+          }, 30_000).unref?.()
+        } else {
+          uploadProgress.delete(uploadId)
+        }
+      }
       if (tempPath) {
         await unlink(tempPath).catch(() => {})
       }
@@ -507,7 +640,7 @@ export function createApp({ db, storage, config }: CreateAppDeps): Hono {
     }
 
     try {
-      const stream = await storage.downloadStream({
+      const encryptedStream = await storage.downloadStream({
         chatId: record.tg_chat_id,
         messageId: record.tg_message_id,
         fileId: record.tg_file_id,
@@ -519,8 +652,16 @@ export function createApp({ db, storage, config }: CreateAppDeps): Hono {
         },
       })
 
+      const plainStream = createDecryptStream(
+        encryptedStream,
+        encryptionKey,
+        record.enc_salt,
+        record.enc_iv,
+        offset
+      )
+
       db.incrementDownloads(record.id)
-      return new Response(stream, { status, headers })
+      return new Response(plainStream, { status, headers })
     } catch (err) {
       if (err instanceof TelegramObjectNotFoundError) {
         return c.text('Not Found\n', 404)

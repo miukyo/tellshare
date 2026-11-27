@@ -35,7 +35,7 @@ const EXTENSION_MIME_MAP: Record<string, string> = {
 }
 
 const EMBED_CRAWLER_RE =
-  /Discordbot|TelegramBot|Twitterbot|Slackbot|WhatsApp|facebookexternalhit|LinkedInBot|vkShare|Embedly|Iframely|MetaInspector|Pinterest/i
+  /TelegramBot|Twitterbot|Slackbot|WhatsApp|facebookexternalhit|LinkedInBot|vkShare|Embedly|Iframely|MetaInspector|Pinterest/i
 
 const UNSAFE_INLINE_MIMES = new Set([
   'text/html',

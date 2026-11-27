@@ -12,6 +12,8 @@ export interface FileRecord {
   tg_chat_id: string
   tg_message_id: number
   tg_file_id: string | null
+  enc_salt: string
+  enc_iv: string
   mgmt_token_hash: string
   created_at: number
   downloads: number
@@ -33,6 +35,11 @@ export class FileDatabase {
   }
 
   private initSchema(): void {
+    const existingCols = this.db.prepare('PRAGMA table_info(files)').all() as Array<{ name: string }>
+    if (existingCols.length > 0 && !existingCols.some((c) => c.name === 'enc_iv')) {
+      this.db.exec('DROP TABLE files;')
+    }
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS files (
         id TEXT PRIMARY KEY,
@@ -44,6 +51,8 @@ export class FileDatabase {
         tg_chat_id TEXT NOT NULL,
         tg_message_id INTEGER NOT NULL,
         tg_file_id TEXT,
+        enc_salt TEXT NOT NULL,
+        enc_iv TEXT NOT NULL,
         mgmt_token_hash TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         downloads INTEGER NOT NULL DEFAULT 0
@@ -59,10 +68,12 @@ export class FileDatabase {
       INSERT INTO files (
         id, ext, filename, mime_type, size, sha256,
         tg_chat_id, tg_message_id, tg_file_id,
+        enc_salt, enc_iv,
         mgmt_token_hash, created_at, downloads
       ) VALUES (
         $id, $ext, $filename, $mime_type, $size, $sha256,
         $tg_chat_id, $tg_message_id, $tg_file_id,
+        $enc_salt, $enc_iv,
         $mgmt_token_hash, $created_at, 0
       )
     `)
@@ -76,6 +87,8 @@ export class FileDatabase {
       $tg_chat_id: record.tg_chat_id,
       $tg_message_id: record.tg_message_id,
       $tg_file_id: record.tg_file_id,
+      $enc_salt: record.enc_salt,
+      $enc_iv: record.enc_iv,
       $mgmt_token_hash: record.mgmt_token_hash,
       $created_at: record.created_at,
     })
@@ -88,18 +101,18 @@ export class FileDatabase {
 
   findExistingBySha256(
     sha256: string
-  ): Pick<FileRecord, 'tg_chat_id' | 'tg_message_id' | 'tg_file_id'> | null {
+  ): Pick<FileRecord, 'tg_chat_id' | 'tg_message_id' | 'tg_file_id' | 'enc_salt' | 'enc_iv'> | null {
     const stmt = this.db.prepare(`
-      SELECT tg_chat_id, tg_message_id, tg_file_id
+      SELECT tg_chat_id, tg_message_id, tg_file_id, enc_salt, enc_iv
       FROM files
-      WHERE sha256 = ?
+      WHERE sha256 = ? AND enc_salt != '' AND enc_iv != ''
       ORDER BY created_at DESC
       LIMIT 1
     `)
     return (
       (stmt.get(sha256) as Pick<
         FileRecord,
-        'tg_chat_id' | 'tg_message_id' | 'tg_file_id'
+        'tg_chat_id' | 'tg_message_id' | 'tg_file_id' | 'enc_salt' | 'enc_iv'
       > | null) ?? null
     )
   }

@@ -2,10 +2,18 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { tl } from '@mtcute/bun'
 import { createApp } from '../src/app'
 import { AppConfig } from '../src/config'
+import {
+  createFileCipher,
+  createSeekedDecipher,
+  generateFileEncryptionParams,
+  incrementCounter,
+} from '../src/crypto'
 import { FileDatabase } from '../src/db'
 import {
   ChannelSetupClient,
   DownloadStreamOptions,
+  SetupBackend,
+  SetupStatus,
   StorageBackend,
   StorageChannelPeer,
   TelegramObjectNotFoundError,
@@ -21,6 +29,7 @@ class MockStorage implements StorageBackend {
   nextMessageId = 1
   uploadCount = 0
   deleteCount = 0
+  lastUploadMeta: { filename: string; mimeType: string; caption?: string } | null = null
   readonly objects = new Map<string, Uint8Array>()
 
   private key(chatId: string, messageId: number): string {
@@ -33,9 +42,16 @@ class MockStorage implements StorageBackend {
 
   async uploadFile(opts: UploadFileOptions): Promise<UploadedObject> {
     this.uploadCount++
+    this.lastUploadMeta = {
+      filename: opts.filename,
+      mimeType: opts.mimeType,
+      caption: opts.caption,
+    }
     const chatId = '-1001234567890'
     const messageId = this.nextMessageId++
     const bytes = new Uint8Array(await Bun.file(opts.filePath).arrayBuffer())
+    opts.onProgress?.(Math.floor(bytes.byteLength / 2), bytes.byteLength)
+    opts.onProgress?.(bytes.byteLength, bytes.byteLength)
     this.objects.set(this.key(chatId, messageId), bytes)
     return {
       chatId,
@@ -75,6 +91,11 @@ class MockStorage implements StorageBackend {
   }
 }
 
+const TEST_ENCRYPTION_KEY = Buffer.from(
+  '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+  'hex'
+)
+
 function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   return {
     port: 3000,
@@ -87,6 +108,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     dataDir: './data',
     maxFileSize: 1024,
     allowUrlUpload: true,
+    encryptionKey: TEST_ENCRYPTION_KEY,
     ...overrides,
   }
 }
@@ -158,7 +180,7 @@ describe('TellShare Hono app', () => {
     expect(html).toContain('<pre>')
     expect(html).toContain('<input')
     expect(html).toContain('<button')
-    expect(html).toContain('<progress')
+    expect(html).not.toContain('<progress')
     expect(html).toContain('Retention: unlimited')
     expect(html).toContain('CURL &amp; HTTP API')
 
@@ -348,18 +370,27 @@ describe('TellShare Hono app', () => {
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)' },
     })
     expect(discordImg.status).toBe(200)
-    expect(discordImg.headers.get('content-type')).toContain('text/html')
-    const imgHtml = await discordImg.text()
+    expect(discordImg.headers.get('content-type')).toBe('image/png')
+    expect(new Uint8Array(await discordImg.arrayBuffer())).toEqual(imgBytes)
+
+    const telegramImg = await app.request(imgMeta.url, {
+      headers: { 'User-Agent': 'TelegramBot (like TwitterBot)' },
+    })
+    expect(telegramImg.status).toBe(200)
+    expect(telegramImg.headers.get('content-type')).toContain('text/html')
+    const imgHtml = await telegramImg.text()
     expect(imgHtml).toContain(`property="og:image" content="${imgMeta.url}?raw=1"`)
     expect(imgHtml).toContain('name="twitter:card" content="summary_large_image"')
+    expect(imgHtml).not.toContain('og:site_name')
+    expect(imgHtml).not.toContain('og:title')
 
     // ?raw=1 returns the actual binary even for crawlers
-    const discordRaw = await app.request(`${imgMeta.url}?raw=1`, {
-      headers: { 'User-Agent': 'Discordbot/2.0' },
+    const rawImg = await app.request(`${imgMeta.url}?raw=1`, {
+      headers: { 'User-Agent': 'TelegramBot' },
     })
-    expect(discordRaw.status).toBe(200)
-    expect(discordRaw.headers.get('content-type')).toBe('image/png')
-    expect(new Uint8Array(await discordRaw.arrayBuffer())).toEqual(imgBytes)
+    expect(rawImg.status).toBe(200)
+    expect(rawImg.headers.get('content-type')).toBe('image/png')
+    expect(new Uint8Array(await rawImg.arrayBuffer())).toEqual(imgBytes)
 
     // Normal browser/curl requests receive raw media directly
     const normalGet = await app.request(imgMeta.url, {
@@ -368,7 +399,7 @@ describe('TellShare Hono app', () => {
     expect(normalGet.status).toBe(200)
     expect(normalGet.headers.get('content-type')).toBe('image/png')
 
-    // Video MIME inference + TelegramBot/Twitterbot video embed
+    // Video MIME inference + Discord raw media + TelegramBot/Twitterbot video embed
     const vidBytes = new Uint8Array([0, 0, 0, 24, 102, 116, 121, 112])
     const vidUp = await uploadSample(
       app,
@@ -381,6 +412,12 @@ describe('TellShare Hono app', () => {
     const vidMeta = (await vidUp.json()) as { url: string; mimeType: string }
     expect(vidMeta.mimeType).toBe('video/mp4')
 
+    const discordVid = await app.request(vidMeta.url, {
+      headers: { 'User-Agent': 'Discordbot/2.0' },
+    })
+    expect(discordVid.status).toBe(200)
+    expect(discordVid.headers.get('content-type')).toBe('video/mp4')
+
     for (const botUa of ['TelegramBot (like TwitterBot)', 'Twitterbot/1.0']) {
       const botRes = await app.request(vidMeta.url, { headers: { 'User-Agent': botUa } })
       expect(botRes.status).toBe(200)
@@ -389,6 +426,8 @@ describe('TellShare Hono app', () => {
       expect(botHtml).toContain(`property="og:video" content="${vidMeta.url}?raw=1"`)
       expect(botHtml).toContain('property="og:video:type" content="video/mp4"')
       expect(botHtml).toContain(`name="twitter:player:stream" content="${vidMeta.url}?raw=1"`)
+      expect(botHtml).not.toContain('og:site_name')
+      expect(botHtml).not.toContain('og:title')
     }
 
     // Audio embed
@@ -398,6 +437,138 @@ describe('TellShare Hono app', () => {
     expect(audioBot.status).toBe(200)
     const audioHtml = await audioBot.text()
     expect(audioHtml).toContain(`property="og:audio" content="${audioMeta.url}?raw=1"`)
+  })
+
+  it('tracks Telegram upload progress via /upload-progress/:uploadId', async () => {
+    let releaseUpload: (() => void) | null = null
+    const slowStorage: StorageBackend = {
+      isConnected: () => true,
+      async uploadFile(opts) {
+        opts.onProgress?.(4, opts.size)
+        await new Promise<void>((resolve) => {
+          releaseUpload = resolve
+        })
+        opts.onProgress?.(opts.size, opts.size)
+        return { chatId: '-1001', messageId: 99, fileId: 'f99' }
+      },
+      downloadStream: storage.downloadStream.bind(storage),
+      deleteFile: storage.deleteFile.bind(storage),
+    }
+
+    const slowApp = createApp({ db, storage: slowStorage, config })
+    const form = new FormData()
+    form.append('file', new File(['0123456789'], 'progress.txt', { type: 'text/plain' }))
+
+    const uploadPromise = slowApp.request('http://localhost:3000/', {
+      method: 'POST',
+      headers: { 'X-Upload-Id': 'up-123' },
+      body: form,
+    })
+
+    // Wait until slowStorage.uploadFile starts
+    await Bun.sleep(20)
+    const midRes = await slowApp.request('http://localhost:3000/upload-progress/up-123')
+    expect(midRes.status).toBe(200)
+    expect(await midRes.json()).toEqual({ uploaded: 4, total: 10, done: false })
+
+    releaseUpload!()
+    const finalRes = await uploadPromise
+    expect(finalRes.status).toBe(200)
+
+    const doneRes = await slowApp.request('http://localhost:3000/upload-progress/up-123')
+    expect(doneRes.status).toBe(200)
+    expect(await doneRes.json()).toEqual({ uploaded: 10, total: 10, done: true })
+  })
+
+  it('serves first-time setup UI when disconnected and locks setup endpoints once connected', async () => {
+    class MockSetup implements SetupBackend {
+      status: SetupStatus = { connected: false, state: 'idle' }
+      constructor(private readonly targetStorage: MockStorage) {
+        this.targetStorage.connected = false
+      }
+      getSetupStatus(): SetupStatus {
+        return this.status
+      }
+      async startQrLogin(): Promise<SetupStatus> {
+        this.status = {
+          connected: false,
+          state: 'qr_pending',
+          qrAscii: '██ ██\n  █  \n██ ██',
+          qrUrl: 'tg://login?token=abc',
+        }
+        return this.status
+      }
+      async sendPhoneCode(phone: string): Promise<SetupStatus> {
+        this.status = { connected: false, state: 'code_sent' }
+        expect(phone).toBe('+15551234567')
+        return this.status
+      }
+      async submitPhoneCode(code: string): Promise<SetupStatus> {
+        expect(code).toBe('12345')
+        this.targetStorage.connected = true
+        this.status = { connected: true, state: 'connected', storageChatId: -100777 }
+        return this.status
+      }
+      async submitPassword(): Promise<SetupStatus> {
+        return this.status
+      }
+    }
+
+    const setup = new MockSetup(storage)
+    const setupApp = createApp({ db, storage, setup, config })
+
+    // Browser GET / renders setup UI with valid JS
+    const setupPageRes = await setupApp.request('http://localhost:3000/', {
+      headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'text/html' },
+    })
+    expect(setupPageRes.status).toBe(200)
+    const setupHtml = await setupPageRes.text()
+    expect(setupHtml).toContain('<title>TellShare Setup</title>')
+    expect(setupHtml).toContain('Generate QR Code')
+    expect(setupHtml).not.toContain('<style')
+    const setupScript = /<script>([\s\S]*?)<\/script>/.exec(setupHtml)
+    expect(setupScript?.[1]).toBeTruthy()
+    expect(() => new Function(setupScript![1])).not.toThrow()
+
+    // Uploads blocked with 503 before setup completes
+    const blockedUp = await uploadSample(setupApp, 'hi', 'hi.txt', 'text/plain')
+    expect(blockedUp.status).toBe(503)
+
+    // QR flow
+    const qrRes = await setupApp.request('http://localhost:3000/setup/qr', { method: 'POST' })
+    expect(qrRes.status).toBe(200)
+    const qrJson = (await qrRes.json()) as SetupStatus
+    expect(qrJson.state).toBe('qr_pending')
+    expect(qrJson.qrAscii).toContain('██')
+
+    // Phone + code flow completes setup
+    const phoneRes = await setupApp.request('http://localhost:3000/setup/phone', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: '+15551234567' }),
+    })
+    expect(phoneRes.status).toBe(200)
+    expect(((await phoneRes.json()) as SetupStatus).state).toBe('code_sent')
+
+    const codeRes = await setupApp.request('http://localhost:3000/setup/code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: '12345' }),
+    })
+    expect(codeRes.status).toBe(200)
+    expect(((await codeRes.json()) as SetupStatus).connected).toBe(true)
+
+    // Once connected, /setup/* endpoints return 403 and GET / serves upload UI
+    const lockedRes = await setupApp.request('http://localhost:3000/setup/status')
+    expect(lockedRes.status).toBe(403)
+    const lockedQr = await setupApp.request('http://localhost:3000/setup/qr', { method: 'POST' })
+    expect(lockedQr.status).toBe(403)
+
+    const readyPage = await setupApp.request('http://localhost:3000/', {
+      headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'text/html' },
+    })
+    expect(readyPage.status).toBe(200)
+    expect(await readyPage.text()).toContain('<title>TellShare</title>')
   })
 
   it('derives public URLs from request headers and origin when BASE_URL is unset', async () => {
@@ -447,7 +618,7 @@ describe('TellShare Hono app', () => {
     const slugPath = new URL(uploadedUrl).pathname
     const botRes = await autoApp.request(`http://127.0.0.1:3000${slugPath}`, {
       headers: {
-        'User-Agent': 'Discordbot/2.0',
+        'User-Agent': 'TelegramBot',
         'X-Forwarded-Proto': 'https',
         Host: 'files.example.com',
       },
@@ -466,6 +637,50 @@ describe('TellShare Hono app', () => {
     expect((await fallbackRes.text()).trim()).toMatch(
       /^http:\/\/share\.local:8080\/[0-9A-Za-z]{32}\.txt$/
     )
+  })
+
+  it('encrypts files stored in Telegram with opaque metadata and decrypts full & cross-block range streams', async () => {
+    const plaintext = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz!@#$%^&*()_+-=[]{}|;:,.<>?/~`'
+    const up = await uploadSample(
+      app,
+      plaintext,
+      'secret-notes.txt',
+      'text/plain',
+      {},
+      { Accept: 'application/json' }
+    )
+    expect(up.status).toBe(200)
+    const meta = (await up.json()) as { id: string; url: string }
+
+    // Telegram storage receives encrypted bytes and opaque metadata
+    expect(storage.lastUploadMeta).toEqual({
+      filename: `${meta.id}.bin`,
+      mimeType: 'application/octet-stream',
+      caption: meta.id,
+    })
+    const storedBytes = storage.objects.get('-1001234567890:1')!
+    expect(storedBytes.byteLength).toBe(plaintext.length)
+    expect(Buffer.from(storedBytes).toString('utf8')).not.toBe(plaintext)
+
+    // Full download decrypts seamlessly
+    const fullRes = await app.request(meta.url)
+    expect(fullRes.status).toBe(200)
+    expect(await fullRes.text()).toBe(plaintext)
+
+    // Cross-block byte range (offset 19 crosses 16-byte AES block boundary -> offset 19..47)
+    const rangeRes = await app.request(meta.url, { headers: { Range: 'bytes=19-47' } })
+    expect(rangeRes.status).toBe(206)
+    expect(rangeRes.headers.get('content-range')).toBe(`bytes 19-47/${plaintext.length}`)
+    expect(await rangeRes.text()).toBe(plaintext.slice(19, 48))
+
+    // Deduplicated upload reuses the encrypted object and still decrypts cleanly
+    const dupRes = await uploadSample(app, plaintext, 'dup.txt', 'text/plain')
+    expect(dupRes.status).toBe(200)
+    expect(storage.uploadCount).toBe(1)
+    const dupUrl = (await dupRes.text()).trim()
+    const dupGet = await app.request(dupUrl)
+    expect(dupGet.status).toBe(200)
+    expect(await dupGet.text()).toBe(plaintext)
   })
 })
 
@@ -575,5 +790,24 @@ describe('isRetryableUploadError', () => {
     expect(isRetryableUploadError(new Error('Invalid argument'))).toBe(false)
     expect(isRetryableUploadError(new tl.RpcError(400, 'CHAT_ID_INVALID'))).toBe(false)
     expect(isRetryableUploadError('plain string')).toBe(false)
+  })
+})
+
+describe('AES-256-CTR helpers', () => {
+  it('increments 128-bit big-endian counters including multi-byte carry', () => {
+    const iv = Buffer.from('0000000000000000ffffffffffffffff', 'hex')
+    expect(incrementCounter(iv, 1).toString('hex')).toBe('00000000000000010000000000000000')
+    expect(incrementCounter(iv, 0).toString('hex')).toBe('0000000000000000ffffffffffffffff')
+  })
+
+  it('seeks and decrypts from arbitrary unaligned byte offsets', () => {
+    const { salt, iv } = generateFileEncryptionParams()
+    const cipher = createFileCipher(TEST_ENCRYPTION_KEY, salt, iv)
+    const plain = Buffer.from('0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')
+    const encrypted = Buffer.concat([cipher.update(plain), cipher.final()])
+
+    const decipher = createSeekedDecipher(TEST_ENCRYPTION_KEY, salt, iv, 21)
+    const decryptedSlice = Buffer.concat([decipher.update(encrypted.subarray(21)), decipher.final()])
+    expect(decryptedSlice.toString('utf8')).toBe(plain.subarray(21).toString('utf8'))
   })
 })

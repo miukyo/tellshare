@@ -1,3 +1,5 @@
+import { parseEncryptionKey } from './crypto'
+
 export interface AppConfig {
   port: number
   host: string
@@ -10,6 +12,7 @@ export interface AppConfig {
   dataDir: string
   maxFileSize: number
   allowUrlUpload: boolean
+  encryptionKey?: Buffer
 }
 
 function parseIntEnv(value: string | undefined, fallback: number, name: string): number {
@@ -56,6 +59,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
 
   const maxFileSize = parseIntEnv(env.MAX_FILE_SIZE, 512 * 1024 * 1024, 'MAX_FILE_SIZE')
   const allowUrlUpload = parseBooleanEnv(env.ALLOW_URL_UPLOAD, true)
+  const rawEncKey = (env.ENCRYPTION_KEY ?? '').trim()
+  const encryptionKey = rawEncKey ? parseEncryptionKey(rawEncKey) : undefined
 
   return {
     port,
@@ -69,7 +74,17 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     dataDir,
     maxFileSize,
     allowUrlUpload,
+    encryptionKey,
   }
+}
+
+export function assertEncryptionConfig(config: AppConfig): Buffer {
+  if (!config.encryptionKey || config.encryptionKey.length !== 32) {
+    throw new Error(
+      'ENCRYPTION_KEY is required. Generate one with: bun -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"'
+    )
+  }
+  return config.encryptionKey
 }
 
 export function assertTelegramConfig(config: AppConfig): void {
