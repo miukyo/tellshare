@@ -18,12 +18,36 @@ const ASCII_BANNER = [
   '/_/    \\___//_/ /_/   /____/ /_/ /_/\\__,_/_/    \\___/  ',
 ].join('\n')
 
+const REPO_URL = 'https://github.com/miukyo/tellshare'
+
+const LEGAL_PRIVACY_POLICY = [
+  'LEGAL & PRIVACY POLICY',
+  '----------------------',
+  '- No accounts or tracking: TellShare does not use accounts, cookies, analytics, or tracking.',
+  '- Stored metadata: Only file ID, filename, MIME type, size, plaintext SHA-256, per-file encryption',
+  '  salt/IV, Telegram message references, hashed X-Token, creation timestamp, and download count are',
+  '  stored in DATA_DIR/tellshare.db.',
+  '- Encryption & access: Files are encrypted server-side with AES-256-CTR before upload to Telegram',
+  '  under random opaque .bin filenames unrelated to the share URL. Anyone with the share URL can',
+  '  download the file; X-Token grants deletion rights. Back up ENCRYPTION_KEY and tellshare.db —',
+  '  files cannot be decrypted without them.',
+  '- Operator access & trust: Because encryption is server-side (not zero-knowledge), the server',
+  '  operator technically has access to stored metadata and can decrypt files if required (for',
+  '  example, for abuse moderation or legal compliance). The operator does not actively browse or',
+  '  share user files; for sensitive data, encrypt files client-side before uploading (e.g., age,',
+  `  gpg, or an encrypted archive). TellShare is open-source at ${REPO_URL} —`,
+  '  you can audit the code or self-host your own instance.',
+  '- Acceptable use & disclaimer: Do not upload illegal, copyrighted, or malicious content. Software',
+  '  and hosted instances are provided "as-is" without warranty, operators may remove files at any',
+  "  time, and backend storage is subject to Telegram's Terms of Service.",
+].join('\n')
+
 export function renderPlainHelp(
   config: AppConfig,
   stats: { count: number; totalBytes: number },
   baseUrl: string
 ): string {
-  const maxSize = formatBytes(config.maxFileSize)
+  const maxSize = config.maxFileSize > 0 ? formatBytes(config.maxFileSize) : 'unlimited'
   const stored = formatBytes(stats.totalBytes)
   const url = baseUrl
 
@@ -62,14 +86,7 @@ URL uploads:     ${config.allowUrlUpload ? 'enabled' : 'disabled'}
 Media embeds:    enabled (Discord, Telegram, Twitter/X, Slack)
 Active files:    ${stats.count} (${stored})
 
-LEGAL & PRIVACY
----------------
-- No accounts, cookies, or tracking. Do not upload illegal, copyrighted,
-  or malicious content.
-- Files are AES-256-CTR encrypted before storage on Telegram; SQLite stores
-  only file metadata, encryption parameters, and hashed delete tokens.
-- Anyone with a file URL can download it; save X-Token to delete uploads.
-- Provided "as-is" without warranty and subject to Telegram ToS.
+${LEGAL_PRIVACY_POLICY}
 `
 }
 
@@ -189,7 +206,7 @@ Code:  <input id="codeInput" type="text" placeholder="12345" size="12"> <button 
   function applyStatus(data) {
     if (!data) return;
 
-    if (data.connected || data.state === 'connected') {
+    if (data.connected || data.state === 'connected' || data.error === 'Already configured') {
       stopPolling();
       qrBox.textContent = '';
       statusEl.textContent = 'Connected! Redirecting to TellShare...';
@@ -227,7 +244,10 @@ Code:  <input id="codeInput" type="text" placeholder="12345" size="12"> <button 
     if (pollTimer !== null) return;
     pollTimer = setInterval(function () {
       fetch('/setup/status')
-        .then(function (r) { return r.json(); })
+        .then(function (r) {
+          if (r.status === 403) return { connected: true, state: 'connected' };
+          return r.json();
+        })
         .then(applyStatus)
         .catch(function () {});
     }, 1500);
@@ -292,13 +312,20 @@ export function renderWebUi(
 ): string {
   const safeBaseUrl = escapeHtml(baseUrl)
   const originTag = `<span class="origin">${safeBaseUrl}</span>`
-  const maxSizeLabel = escapeHtml(formatBytes(config.maxFileSize))
+  const maxSizeLabel = escapeHtml(
+    config.maxFileSize > 0 ? formatBytes(config.maxFileSize) : 'unlimited'
+  )
   const storedLabel = escapeHtml(formatBytes(stats.totalBytes))
   const urlUploadStatus = config.allowUrlUpload ? 'enabled' : 'disabled'
 
   const urlFieldLine = config.allowUrlUpload
     ? `\nURL:  <input id="urlInput" type="url" name="url" placeholder="https://example.com/file.png" size="48">`
     : ''
+
+  const legalPolicyHtml = escapeHtml(LEGAL_PRIVACY_POLICY).replace(
+    REPO_URL,
+    `<a href="${REPO_URL}" target="_blank" rel="noopener">${REPO_URL}</a>`
+  )
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -349,16 +376,7 @@ File: <input id="fileInput" type="file" name="file">${urlFieldLine}
 6. Health check:
    curl ${originTag}/health</pre>
 
-<pre>LEGAL &amp; PRIVACY POLICY
-----------------------
-- Privacy: No user accounts, cookies, analytics, or tracking. Local SQLite stores
-  only file metadata (ID, filename, MIME, size, SHA-256, encryption salt/IV,
-  Telegram message reference, hashed X-Token, timestamps, download count).
-- Encryption &amp; Access: Files are AES-256-CTR encrypted before upload to Telegram.
-  Anyone with the share URL can download the decrypted file; use X-Token to delete.
-- Acceptable Use &amp; Warranty: Do not upload illegal, copyrighted, or malicious files.
-  Provided "as-is" without warranty; operators may remove content at any time, and
-  storage is subject to Telegram's Terms of Service.</pre>
+<pre>${legalPolicyHtml}</pre>
 
 <script>
 (function () {
@@ -465,6 +483,9 @@ File: <input id="fileInput" type="file" name="file">${urlFieldLine}
     xhr.open('POST', '/');
     xhr.setRequestHeader('Accept', 'application/json');
     xhr.setRequestHeader('X-Upload-Id', uploadId);
+    if (file) {
+      xhr.setRequestHeader('X-File-Size', String(file.size));
+    }
 
     xhr.upload.addEventListener('progress', function (ev) {
       if (ev.lengthComputable && ev.total > 0) {

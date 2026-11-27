@@ -8,7 +8,6 @@ import {
   MtPeerNotFoundError,
   MtUnsupportedError,
   TelegramClient,
-  UploadedFile,
   tl,
 } from '@mtcute/bun'
 import { AppConfig, assertTelegramConfig, parseStorageChatId } from './config'
@@ -30,10 +29,11 @@ export interface DownloadStreamOptions {
 }
 
 export interface UploadFileOptions {
-  filePath: string
+  source: ReadableStream<Uint8Array>
   filename: string
   mimeType: string
-  size: number
+  size?: number
+  estimatedSize?: number
   caption?: string
   onProgress?: (uploaded: number, total: number) => void
 }
@@ -690,35 +690,15 @@ export class TelegramStorage implements StorageBackend, SetupBackend {
       throw new Error('TelegramStorage is not started; storage target is unresolved')
     }
 
-    const maxAttempts = 3
-    let uploaded: UploadedFile | null = null
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        uploaded = await this.client.uploadFile({
-          file: Bun.file(opts.filePath),
-          fileName: opts.filename,
-          fileMime: opts.mimeType,
-          fileSize: opts.size,
-          requestsPerConnection: 2,
-          progressCallback: opts.onProgress,
-        })
-        break
-      } catch (err) {
-        if (attempt === maxAttempts || !isRetryableUploadError(err)) {
-          throw err
-        }
-        const delayMs = attempt * 2000
-        console.warn(
-          `[tellshare] Telegram upload attempt ${attempt}/${maxAttempts} failed (${err instanceof Error ? err.message : String(err)}); retrying in ${delayMs}ms...`
-        )
-        await Bun.sleep(delayMs)
-      }
-    }
-
-    if (!uploaded) {
-      throw new Error('Failed to upload file to Telegram')
-    }
+    const uploaded = await this.client.uploadFile({
+      file: opts.source,
+      fileName: opts.filename,
+      fileMime: opts.mimeType,
+      fileSize: opts.size,
+      estimatedSize: opts.estimatedSize,
+      requestsPerConnection: 2,
+      progressCallback: opts.onProgress,
+    })
 
     const msg = await this.client.sendMedia(
       target,

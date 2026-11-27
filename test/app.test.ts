@@ -49,7 +49,7 @@ class MockStorage implements StorageBackend {
     }
     const chatId = '-1001234567890'
     const messageId = this.nextMessageId++
-    const bytes = new Uint8Array(await Bun.file(opts.filePath).arrayBuffer())
+    const bytes = new Uint8Array(await new Response(opts.source).arrayBuffer())
     opts.onProgress?.(Math.floor(bytes.byteLength / 2), bytes.byteLength)
     opts.onProgress?.(bytes.byteLength, bytes.byteLength)
     this.objects.set(this.key(chatId, messageId), bytes)
@@ -107,6 +107,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     storageChannelName: 'tellshare files',
     dataDir: './data',
     maxFileSize: 1024,
+    partSize: 512 * 1024 * 1024,
     allowUrlUpload: true,
     encryptionKey: TEST_ENCRYPTION_KEY,
     ...overrides,
@@ -231,7 +232,9 @@ describe('TellShare Hono app', () => {
     expect(json2.url).toBe(`http://localhost:3000/${json2.id}.txt`)
     expect(json2.size).toBe(payload.length)
     expect(json2.mimeType).toBe('text/plain')
-    expect(storage.uploadCount).toBe(1)
+    // Zero-disk streaming cleans up the duplicate Telegram message once SHA-256 matches
+    expect(storage.objects.size).toBe(1)
+    expect(storage.deleteCount).toBe(1)
 
     // Deleting first reference keeps Telegram object alive because second reference still exists
     const del1 = await app.request(url1, {
@@ -239,7 +242,7 @@ describe('TellShare Hono app', () => {
       headers: { 'X-Token': token1! },
     })
     expect(del1.status).toBe(200)
-    expect(storage.deleteCount).toBe(0)
+    expect(storage.deleteCount).toBe(1)
     expect(storage.objects.size).toBe(1)
 
     // Second reference still downloads cleanly
@@ -253,7 +256,7 @@ describe('TellShare Hono app', () => {
       headers: { Authorization: `Bearer ${json2.token}` },
     })
     expect(del2.status).toBe(200)
-    expect(storage.deleteCount).toBe(1)
+    expect(storage.deleteCount).toBe(2)
     expect(storage.objects.size).toBe(0)
   })
 
@@ -444,11 +447,12 @@ describe('TellShare Hono app', () => {
     const slowStorage: StorageBackend = {
       isConnected: () => true,
       async uploadFile(opts) {
-        opts.onProgress?.(4, opts.size)
+        const bytes = new Uint8Array(await new Response(opts.source).arrayBuffer())
+        opts.onProgress?.(4, bytes.byteLength)
         await new Promise<void>((resolve) => {
           releaseUpload = resolve
         })
-        opts.onProgress?.(opts.size, opts.size)
+        opts.onProgress?.(bytes.byteLength, bytes.byteLength)
         return { chatId: '-1001', messageId: 99, fileId: 'f99' }
       },
       downloadStream: storage.downloadStream.bind(storage),
@@ -461,7 +465,7 @@ describe('TellShare Hono app', () => {
 
     const uploadPromise = slowApp.request('http://localhost:3000/', {
       method: 'POST',
-      headers: { 'X-Upload-Id': 'up-123' },
+      headers: { 'X-Upload-Id': 'up-123', 'X-File-Size': '10' },
       body: form,
     })
 
@@ -558,11 +562,18 @@ describe('TellShare Hono app', () => {
     expect(codeRes.status).toBe(200)
     expect(((await codeRes.json()) as SetupStatus).connected).toBe(true)
 
-    // Once connected, /setup/* endpoints return 403 and GET / serves upload UI
-    const lockedRes = await setupApp.request('http://localhost:3000/setup/status')
-    expect(lockedRes.status).toBe(403)
+    // Once connected, GET /setup/status confirms connection for polling UI while POST /setup/* endpoints return 403
+    const statusAfterRes = await setupApp.request('http://localhost:3000/setup/status')
+    expect(statusAfterRes.status).toBe(200)
+    expect(await statusAfterRes.json()).toEqual({ connected: true, state: 'connected' })
     const lockedQr = await setupApp.request('http://localhost:3000/setup/qr', { method: 'POST' })
     expect(lockedQr.status).toBe(403)
+    const lockedPhone = await setupApp.request('http://localhost:3000/setup/phone', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone: '+15551234567' }),
+    })
+    expect(lockedPhone.status).toBe(403)
 
     const readyPage = await setupApp.request('http://localhost:3000/', {
       headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'text/html' },
@@ -652,12 +663,12 @@ describe('TellShare Hono app', () => {
     expect(up.status).toBe(200)
     const meta = (await up.json()) as { id: string; url: string }
 
-    // Telegram storage receives encrypted bytes and opaque metadata
-    expect(storage.lastUploadMeta).toEqual({
-      filename: `${meta.id}.bin`,
-      mimeType: 'application/octet-stream',
-      caption: meta.id,
-    })
+    // Telegram storage receives encrypted bytes and an opaque blob name unrelated to the share URL ID
+    expect(storage.lastUploadMeta).not.toBeNull()
+    expect(storage.lastUploadMeta?.filename).toMatch(/^[0-9a-f]{32}\.bin$/)
+    expect(storage.lastUploadMeta?.filename).not.toContain(meta.id)
+    expect(storage.lastUploadMeta?.mimeType).toBe('application/octet-stream')
+    expect(storage.lastUploadMeta?.caption).toBeUndefined()
     const storedBytes = storage.objects.get('-1001234567890:1')!
     expect(storedBytes.byteLength).toBe(plaintext.length)
     expect(Buffer.from(storedBytes).toString('utf8')).not.toBe(plaintext)
@@ -673,14 +684,88 @@ describe('TellShare Hono app', () => {
     expect(rangeRes.headers.get('content-range')).toBe(`bytes 19-47/${plaintext.length}`)
     expect(await rangeRes.text()).toBe(plaintext.slice(19, 48))
 
-    // Deduplicated upload reuses the encrypted object and still decrypts cleanly
+    // Deduplicated upload reuses the encrypted object and cleans up duplicate part
     const dupRes = await uploadSample(app, plaintext, 'dup.txt', 'text/plain')
     expect(dupRes.status).toBe(200)
-    expect(storage.uploadCount).toBe(1)
+    expect(storage.objects.size).toBe(1)
+    expect(storage.deleteCount).toBe(1)
     const dupUrl = (await dupRes.text()).trim()
     const dupGet = await app.request(dupUrl)
     expect(dupGet.status).toBe(200)
     expect(await dupGet.text()).toBe(plaintext)
+  })
+
+  it('splits large files into encrypted multi-part Telegram messages and supports cross-part Range requests', async () => {
+    const mpApp = createApp({
+      db,
+      storage,
+      config: makeConfig({ partSize: 16, maxFileSize: 0 }),
+    })
+
+    const payload = Array.from({ length: 100 }, (_, i) => String.fromCharCode(65 + (i % 26))).join('')
+    const up = await uploadSample(
+      mpApp,
+      payload,
+      'multi.bin',
+      'application/octet-stream',
+      {},
+      { Accept: 'application/json' }
+    )
+    expect(up.status).toBe(200)
+    const meta = (await up.json()) as { id: string; url: string; token: string }
+
+    // 100 bytes with 16-byte partSize -> 7 parts (6 x 16 + 1 x 4)
+    expect(storage.uploadCount).toBe(7)
+    expect(storage.objects.size).toBe(7)
+    expect(db.getParts(meta.id)).toHaveLength(7)
+
+    // Full download stitches & decrypts all 7 parts seamlessly
+    const fullRes = await mpApp.request(meta.url)
+    expect(fullRes.status).toBe(200)
+    expect(await fullRes.text()).toBe(payload)
+
+    // Range spanning part 0 (12..15), part 1 (16..31), and part 2 (32..35)
+    const rangeRes = await mpApp.request(meta.url, { headers: { Range: 'bytes=12-35' } })
+    expect(rangeRes.status).toBe(206)
+    expect(rangeRes.headers.get('content-range')).toBe('bytes 12-35/100')
+    expect(await rangeRes.text()).toBe(payload.slice(12, 36))
+
+    // Deleting removes all 7 Telegram messages
+    const delRes = await mpApp.request(meta.url, {
+      method: 'DELETE',
+      headers: { 'X-Token': meta.token },
+    })
+    expect(delRes.status).toBe(200)
+    expect(storage.deleteCount).toBe(7)
+    expect(storage.objects.size).toBe(0)
+  })
+
+  it('treats MAX_FILE_SIZE=0 as unlimited and cleans up partial parts when oversize fails mid-stream', async () => {
+    const unlimitedApp = createApp({
+      db,
+      storage,
+      config: makeConfig({ maxFileSize: 0, partSize: 512 }),
+    })
+    const home = await unlimitedApp.request('http://localhost:3000/', {
+      headers: { 'User-Agent': 'curl/8.5.0' },
+    })
+    expect(await home.text()).toContain('Max size:   unlimited'.replace('Max size:', 'Max file size:'))
+
+    const bigPayload = new Uint8Array(2048).fill(88)
+    const bigUp = await uploadSample(unlimitedApp, bigPayload, '2k.bin', 'application/octet-stream')
+    expect(bigUp.status).toBe(200)
+
+    // Reset storage and test mid-stream oversize cleanup (without X-File-Size header)
+    const cappedApp = createApp({
+      db,
+      storage,
+      config: makeConfig({ maxFileSize: 40, partSize: 16 }),
+    })
+    const beforeObjs = storage.objects.size
+    const oversizePayload = new Uint8Array(60).fill(90)
+    const oversizeRes = await uploadSample(cappedApp, oversizePayload, 'too-big.bin', 'application/octet-stream')
+    expect(oversizeRes.status).toBe(413)
+    expect(storage.objects.size).toBe(beforeObjs)
   })
 })
 

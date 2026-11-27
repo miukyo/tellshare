@@ -1,8 +1,7 @@
-import { Cipheriv, createHash, randomUUID } from 'node:crypto'
-import { createWriteStream } from 'node:fs'
-import { unlink } from 'node:fs/promises'
-import os from 'node:os'
+import { createHash, randomBytes } from 'node:crypto'
 import path from 'node:path'
+import { Readable } from 'node:stream'
+import Busboy from 'busboy'
 import { Context, Hono } from 'hono'
 import { AppConfig, assertEncryptionConfig } from './config'
 import {
@@ -10,7 +9,7 @@ import {
   createFileCipher,
   generateFileEncryptionParams,
 } from './crypto'
-import { FileDatabase, FileRecord } from './db'
+import { FileDatabase, FilePartRecord, FileRecord } from './db'
 import { SetupBackend, StorageBackend, TelegramObjectNotFoundError } from './telegram'
 import {
   generateId,
@@ -40,6 +39,13 @@ class PayloadTooLargeError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'PayloadTooLargeError'
+  }
+}
+
+class BadRequestError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'BadRequestError'
   }
 }
 
@@ -114,84 +120,213 @@ function extractFilenameFromHeaders(contentDisposition: string | null, url: URL)
   return sanitizeFilename(segment || 'download')
 }
 
-async function spoolStreamToTempFile(
-  stream: ReadableStream<Uint8Array>,
-  maxFileSize: number,
-  cipher: Cipheriv
-): Promise<{ tempPath: string; size: number; sha256: string }> {
-  const tempPath = path.join(os.tmpdir(), `tellshare-${randomUUID()}`)
-  const hasher = createHash('sha256')
-  const writeStream = createWriteStream(tempPath, { flags: 'wx' })
-  const reader = stream.getReader()
-  let totalSize = 0
+interface UploadedPartsResult {
+  size: number
+  sha256: string
+  encSalt: string
+  encIv: string
+  parts: FilePartRecord[]
+}
 
-  const writeChunk = async (buf: Uint8Array) => {
-    if (buf.byteLength === 0) return
-    if (!writeStream.write(buf)) {
-      await new Promise<void>((resolve, reject) => {
-        const onDrain = () => {
-          writeStream.off('error', onError)
-          resolve()
-        }
-        const onError = (err: Error) => {
-          writeStream.off('drain', onDrain)
-          reject(err)
-        }
-        writeStream.once('drain', onDrain)
-        writeStream.once('error', onError)
+async function cleanupUploadedParts(
+  storage: StorageBackend,
+  parts: Array<Pick<FilePartRecord, 'tg_chat_id' | 'tg_message_id'>>
+): Promise<void> {
+  await Promise.allSettled(
+    parts.map((p) =>
+      storage.deleteFile({
+        chatId: p.tg_chat_id,
+        messageId: p.tg_message_id,
       })
+    )
+  )
+}
+
+async function uploadStreamInParts(opts: {
+  source: ReadableStream<Uint8Array>
+  id: string
+  partSize: number
+  maxFileSize: number
+  knownTotalSize?: number
+  encryptionKey: Buffer
+  storage: StorageBackend
+  onProgress?: (uploadedBytes: number, totalBytes: number) => void
+}): Promise<UploadedPartsResult> {
+  const {
+    source,
+    id,
+    partSize,
+    maxFileSize,
+    knownTotalSize,
+    encryptionKey,
+    storage,
+    onProgress,
+  } = opts
+
+  if (maxFileSize > 0 && knownTotalSize !== undefined && knownTotalSize > maxFileSize) {
+    await source.cancel().catch(() => {})
+    throw new PayloadTooLargeError(`File exceeds max size of ${maxFileSize} bytes`)
+  }
+
+  const { salt: encSalt, iv: encIv } = generateFileEncryptionParams()
+  const cipher = createFileCipher(encryptionKey, encSalt, encIv)
+  const hasher = createHash('sha256')
+  const reader = source.getReader()
+  const parts: FilePartRecord[] = []
+
+  let totalSize = 0
+  let leftover: Uint8Array | null = null
+  let eof = false
+
+  const pullNextNonEmpty = async (): Promise<Uint8Array | null> => {
+    if (leftover && leftover.byteLength > 0) {
+      const out = leftover
+      leftover = null
+      return out
+    }
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) {
+        eof = true
+        return null
+      }
+      if (value.byteLength > 0) {
+        return value
+      }
     }
   }
 
   try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      totalSize += value.byteLength
-      if (totalSize > maxFileSize) {
-        throw new PayloadTooLargeError(`File exceeds max size of ${maxFileSize} bytes`)
+    const firstChunk = await pullNextNonEmpty()
+    if (firstChunk === null) {
+      return {
+        size: 0,
+        sha256: hasher.digest('hex'),
+        encSalt,
+        encIv,
+        parts: [],
       }
-      hasher.update(value)
-      await writeChunk(cipher.update(value))
     }
+    leftover = firstChunk
 
-    await writeChunk(cipher.final())
+    let partIndex = 0
+    while (true) {
+      const partOffset = totalSize
+      let partBytesFed = 0
+      const knownPartSize =
+        knownTotalSize !== undefined && knownTotalSize > partOffset
+          ? Math.min(partSize, knownTotalSize - partOffset)
+          : undefined
 
-    await new Promise<void>((resolve, reject) => {
-      const onFinish = () => {
-        writeStream.off('error', onError)
-        resolve()
+      const partStream = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          try {
+            if (partBytesFed >= partSize) {
+              controller.close()
+              return
+            }
+            const raw = await pullNextNonEmpty()
+            if (raw === null) {
+              const tail = cipher.final()
+              if (tail.byteLength > 0) {
+                controller.enqueue(new Uint8Array(tail))
+              }
+              controller.close()
+              return
+            }
+
+            const take = Math.min(raw.byteLength, partSize - partBytesFed)
+            const slice = take === raw.byteLength ? raw : raw.subarray(0, take)
+            if (take < raw.byteLength) {
+              leftover = raw.subarray(take)
+            }
+
+            totalSize += slice.byteLength
+            if (maxFileSize > 0 && totalSize > maxFileSize) {
+              throw new PayloadTooLargeError(`File exceeds max size of ${maxFileSize} bytes`)
+            }
+
+            partBytesFed += slice.byteLength
+            hasher.update(slice)
+            const encrypted = cipher.update(slice)
+            if (encrypted.byteLength > 0) {
+              controller.enqueue(new Uint8Array(encrypted))
+            }
+
+            if (partBytesFed >= partSize) {
+              controller.close()
+            }
+          } catch (err) {
+            controller.error(err)
+          }
+        },
+        cancel() {
+          reader.cancel().catch(() => {})
+        },
+      })
+
+      const blobId = randomBytes(16).toString('hex')
+      const tgObj = await storage.uploadFile({
+        source: partStream,
+        filename: `${blobId}.bin`,
+        mimeType: 'application/octet-stream',
+        size: knownPartSize,
+        estimatedSize: knownPartSize ?? partSize,
+        caption: undefined,
+        onProgress: onProgress
+          ? (partUploaded, partTotal) => {
+              const clamped = Math.min(partUploaded, partBytesFed || partTotal || partSize)
+              const overallUploaded = partOffset + clamped
+              const overallTotal =
+                knownTotalSize ??
+                Math.max(overallUploaded, partOffset + (partTotal > 0 ? partTotal : partSize))
+              onProgress(overallUploaded, overallTotal)
+            }
+          : undefined,
+      })
+
+      parts.push({
+        file_id: id,
+        part_index: partIndex,
+        byte_offset: partOffset,
+        byte_length: partBytesFed,
+        tg_chat_id: tgObj.chatId,
+        tg_message_id: tgObj.messageId,
+        tg_file_id: tgObj.fileId,
+      })
+
+      if (eof && (!leftover || leftover.byteLength === 0)) {
+        break
       }
-      const onError = (err: Error) => {
-        writeStream.off('finish', onFinish)
-        reject(err)
+
+      const nextPeek = await pullNextNonEmpty()
+      if (nextPeek === null) {
+        break
       }
-      writeStream.once('finish', onFinish)
-      writeStream.once('error', onError)
-      writeStream.end()
-    })
+      leftover = nextPeek
+      partIndex++
+    }
 
     return {
-      tempPath,
       size: totalSize,
       sha256: hasher.digest('hex'),
+      encSalt,
+      encIv,
+      parts,
     }
   } catch (err) {
-    reader.cancel().catch(() => {})
-    writeStream.destroy()
-    await unlink(tempPath).catch(() => {})
+    await reader.cancel().catch(() => {})
+    await cleanupUploadedParts(storage, parts)
     throw err
   }
 }
 
-async function fetchRemoteUrlToTempFile(
+async function fetchRemoteUrlStream(
   rawUrl: string,
-  maxFileSize: number,
-  cipher: Cipheriv
+  maxFileSize: number
 ): Promise<{
-  tempPath: string
-  size: number
-  sha256: string
+  body: ReadableStream<Uint8Array>
+  knownSize?: number
   filename: string
   mimeType: string
 }> {
@@ -212,10 +347,10 @@ async function fetchRemoteUrlToTempFile(
       const location = response.headers.get('location')
       await response.body?.cancel().catch(() => {})
       if (!location) {
-        throw new Error('Upstream redirect missing Location header')
+        throw new BadRequestError('Upstream redirect missing Location header')
       }
       if (i === maxRedirects) {
-        throw new Error('Too many redirects while fetching URL')
+        throw new BadRequestError('Too many redirects while fetching URL')
       }
       const nextRaw = new URL(location, currentUrl).toString()
       currentUrl = await validateRemoteUrl(nextRaw)
@@ -228,31 +363,114 @@ async function fetchRemoteUrlToTempFile(
   if (!response || !response.ok || !response.body) {
     const status = response?.status ?? 502
     await response?.body?.cancel().catch(() => {})
-    throw new Error(`Upstream URL returned HTTP ${status}`)
+    throw new BadRequestError(`Upstream URL returned HTTP ${status}`)
   }
 
+  let knownSize: number | undefined
   const contentLengthHeader = response.headers.get('content-length')
   if (contentLengthHeader) {
     const declaredSize = Number.parseInt(contentLengthHeader, 10)
-    if (Number.isFinite(declaredSize) && declaredSize > maxFileSize) {
-      await response.body.cancel().catch(() => {})
-      throw new PayloadTooLargeError(`Remote file exceeds max size of ${maxFileSize} bytes`)
+    if (Number.isFinite(declaredSize) && declaredSize >= 0) {
+      if (maxFileSize > 0 && declaredSize > maxFileSize) {
+        await response.body.cancel().catch(() => {})
+        throw new PayloadTooLargeError(`Remote file exceeds max size of ${maxFileSize} bytes`)
+      }
+      knownSize = declaredSize
     }
   }
 
-  const spooled = await spoolStreamToTempFile(response.body, maxFileSize, cipher)
   const filename = extractFilenameFromHeaders(
     response.headers.get('content-disposition'),
     currentUrl
   )
   const rawMime = response.headers.get('content-type')?.split(';')[0]?.trim()
-  const mimeType = rawMime || 'application/octet-stream'
+  const mimeType = inferMimeType(filename, rawMime)
 
   return {
-    ...spooled,
+    body: response.body,
+    knownSize,
     filename,
     mimeType,
   }
+}
+
+async function createMultiPartDownloadStream(
+  parts: FilePartRecord[],
+  offset: number,
+  length: number,
+  storage: StorageBackend,
+  db: FileDatabase,
+  signal?: AbortSignal
+): Promise<ReadableStream<Uint8Array>> {
+  const overlapping = parts.filter(
+    (p) => p.byte_offset + p.byte_length > offset && p.byte_offset < offset + length
+  )
+
+  if (overlapping.length === 0) {
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close()
+      },
+    })
+  }
+
+  const openPartStream = async (part: FilePartRecord) => {
+    const localStart = Math.max(0, offset - part.byte_offset)
+    const localEnd = Math.min(part.byte_length, offset + length - part.byte_offset)
+    const localLimit = localEnd - localStart
+    const stream = await storage.downloadStream({
+      chatId: part.tg_chat_id,
+      messageId: part.tg_message_id,
+      fileId: part.tg_file_id,
+      offset: localStart,
+      limit: localLimit,
+      signal,
+      onRefreshedFileId: (newFileId) => {
+        db.updateTgFileId(part.tg_chat_id, part.tg_message_id, newFileId)
+      },
+    })
+    return stream.getReader()
+  }
+
+  // Probe the first overlapping part before committing HTTP 200/206 headers.
+  let currentReader: ReadableStreamDefaultReader<Uint8Array> | null = await openPartStream(
+    overlapping[0]
+  )
+  let nextIdx = 1
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        while (true) {
+          if (currentReader === null) {
+            if (nextIdx >= overlapping.length) {
+              controller.close()
+              return
+            }
+            currentReader = await openPartStream(overlapping[nextIdx++])
+          }
+
+          const { done, value } = await currentReader.read()
+          if (done) {
+            currentReader = null
+            continue
+          }
+          if (value.byteLength > 0) {
+            controller.enqueue(value)
+            return
+          }
+        }
+      } catch (err) {
+        currentReader?.cancel().catch(() => {})
+        currentReader = null
+        controller.error(err)
+      }
+    },
+    cancel() {
+      currentReader?.cancel().catch(() => {})
+      currentReader = null
+    },
+  })
 }
 
 async function deleteRecordAndCleanupTelegram(
@@ -260,14 +478,23 @@ async function deleteRecordAndCleanupTelegram(
   storage: StorageBackend,
   record: FileRecord
 ): Promise<void> {
-  const refCount = db.countByTelegramMessage(record.tg_chat_id, record.tg_message_id)
-  if (refCount <= 1) {
-    await storage.deleteFile({
-      chatId: record.tg_chat_id,
-      messageId: record.tg_message_id,
-    })
+  const parts = db.getParts(record.id)
+  const uniqueMessages = new Map<string, { chatId: string; messageId: number }>()
+  for (const part of parts) {
+    const key = `${part.tg_chat_id}:${part.tg_message_id}`
+    if (!uniqueMessages.has(key)) {
+      uniqueMessages.set(key, { chatId: part.tg_chat_id, messageId: part.tg_message_id })
+    }
   }
+
   db.deleteById(record.id)
+
+  for (const msg of uniqueMessages.values()) {
+    const remainingRefs = db.countByTelegramMessage(msg.chatId, msg.messageId)
+    if (remainingRefs === 0) {
+      await storage.deleteFile(msg)
+    }
+  }
 }
 
 export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
@@ -303,9 +530,13 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
   }
 
   app.get('/setup/status', (c) => {
-    const blocked = guardSetup(c)
-    if (blocked) return blocked
-    return c.json(setup!.getSetupStatus())
+    if (!setup) {
+      return c.json({ error: 'Setup not available' }, 404)
+    }
+    if (storage.isConnected()) {
+      return c.json({ connected: true, state: 'connected' })
+    }
+    return c.json(setup.getSetupStatus())
   })
 
   app.post('/setup/qr', async (c) => {
@@ -363,146 +594,261 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
       return c.text('Telegram not configured yet. Complete setup at /\n', 503)
     }
 
-    let formData: FormData
+    const reqBody = c.req.raw.body
+    if (!reqBody) {
+      return c.text('Invalid multipart/form-data request\n', 400)
+    }
+
+    const reqHeaders: Record<string, string> = {}
+    c.req.raw.headers.forEach((value, key) => {
+      reqHeaders[key.toLowerCase()] = value
+    })
+
+    let bb: Busboy.Busboy
     try {
-      formData = await c.req.raw.formData()
+      bb = Busboy({
+        headers: reqHeaders,
+        highWaterMark: 2 * 1024 * 1024,
+        fileHwm: 1024 * 1024,
+      })
     } catch {
       return c.text('Invalid multipart/form-data request\n', 400)
     }
 
-    const fileEntry = formData.get('file')
-    const urlEntry = formData.get('url')
-
-    const hasFile = fileEntry instanceof File
-    const hasUrl = typeof urlEntry === 'string' && urlEntry.trim().length > 0
-
-    if ((hasFile && hasUrl) || (!hasFile && !hasUrl)) {
-      return c.text('Provide exactly one of "file" or "url"\n', 400)
-    }
-
-    if (hasUrl && !config.allowUrlUpload) {
-      return c.text('Remote URL uploads are disabled\n', 403)
-    }
-
     const nowMs = Date.now()
     const uploadId = (c.req.header('x-upload-id') || c.req.query('uploadId') || '').trim()
+    const rawKnownSize = c.req.header('x-file-size')
+    const parsedKnownSize = rawKnownSize ? Number.parseInt(rawKnownSize, 10) : NaN
+    const knownTotalSize =
+      Number.isFinite(parsedKnownSize) && parsedKnownSize > 0 ? parsedKnownSize : undefined
+
     if (uploadId) {
-      uploadProgress.set(uploadId, { uploaded: 0, total: 0, done: false })
+      uploadProgress.set(uploadId, {
+        uploaded: 0,
+        total: knownTotalSize ?? 0,
+        done: false,
+      })
     }
 
-    let tempPath: string | null = null
+    let id = generateId()
+    for (let attempt = 0; attempt < 10 && db.getById(id) !== null; attempt++) {
+      id = generateId()
+    }
+    if (db.getById(id) !== null) {
+      return c.text('Failed to allocate unique file ID\n', 500)
+    }
+
+    const bodyReader = reqBody.getReader()
+    let sawFile = false
+    let urlValue = ''
     let filename = 'file'
     let mimeType = 'application/octet-stream'
-    let size = 0
-    let sha256 = ''
+    let uploadPromise: Promise<void> | null = null
+    let uploadResult: UploadedPartsResult | null = null
+    let uploadErr: unknown = null
+    let busboyErr: unknown = null
+    let pumpAborted = false
+    let wakePump: (() => void) | null = null
 
-    const { salt: newSalt, iv: newIv } = generateFileEncryptionParams()
-    const cipher = createFileCipher(encryptionKey, newSalt, newIv)
+    const abortPump = () => {
+      if (pumpAborted) return
+      pumpAborted = true
+      bodyReader.cancel().catch(() => {})
+      bb.destroy()
+      wakePump?.()
+    }
+
+    const reportProgress = uploadId
+      ? (uploaded: number, total: number) => {
+          uploadProgress.set(uploadId, { uploaded, total, done: false })
+        }
+      : undefined
+
+    bb.on('field', (name, val) => {
+      if (name === 'url' && val.trim()) {
+        if (sawFile || urlValue) {
+          busboyErr = new BadRequestError('Provide exactly one of "file" or "url"')
+          abortPump()
+          return
+        }
+        urlValue = val.trim()
+      }
+    })
+
+    bb.on('file', (name, fileStream, info) => {
+      if (name !== 'file') {
+        fileStream.resume()
+        return
+      }
+      if (sawFile || urlValue) {
+        fileStream.resume()
+        busboyErr = new BadRequestError('Provide exactly one of "file" or "url"')
+        abortPump()
+        return
+      }
+      sawFile = true
+      filename = sanitizeFilename(info.filename || 'file')
+      mimeType = inferMimeType(filename, info.mimeType)
+
+      const webStream = Readable.toWeb(fileStream) as unknown as ReadableStream<Uint8Array>
+      uploadPromise = uploadStreamInParts({
+        source: webStream,
+        id,
+        partSize: config.partSize,
+        maxFileSize: config.maxFileSize,
+        knownTotalSize,
+        encryptionKey,
+        storage,
+        onProgress: reportProgress,
+      }).then(
+        (res) => {
+          uploadResult = res
+        },
+        (err) => {
+          uploadErr = err
+          abortPump()
+        }
+      )
+    })
+
+    const bbFinished = new Promise<void>((resolve) => {
+      bb.once('finish', () => {
+        wakePump?.()
+        resolve()
+      })
+      bb.once('close', () => {
+        wakePump?.()
+        resolve()
+      })
+      bb.once('error', () => {
+        if (!pumpAborted && !busboyErr) {
+          busboyErr = new BadRequestError('Invalid multipart/form-data request')
+        }
+        wakePump?.()
+        resolve()
+      })
+    })
+
+    const waitForDrain = () =>
+      new Promise<void>((resolve) => {
+        const cleanup = () => {
+          bb.off('drain', onEvent)
+          bb.off('close', onEvent)
+          bb.off('error', onEvent)
+          wakePump = null
+        }
+        const onEvent = () => {
+          cleanup()
+          resolve()
+        }
+        wakePump = onEvent
+        bb.once('drain', onEvent)
+        bb.once('close', onEvent)
+        bb.once('error', onEvent)
+      })
 
     try {
-      if (hasFile) {
-        const uploaded = fileEntry as File
-        if (uploaded.size > config.maxFileSize) {
-          return c.text(`File exceeds max size of ${config.maxFileSize} bytes\n`, 413)
+      try {
+        while (!pumpAborted) {
+          const { done, value } = await bodyReader.read()
+          if (done) {
+            bb.end()
+            break
+          }
+          if (pumpAborted) break
+          if (!bb.write(value)) {
+            await waitForDrain()
+          }
         }
-        const spooled = await spoolStreamToTempFile(uploaded.stream(), config.maxFileSize, cipher)
-        tempPath = spooled.tempPath
-        size = spooled.size
-        sha256 = spooled.sha256
-        filename = sanitizeFilename(uploaded.name || 'file')
-        mimeType = inferMimeType(filename, uploaded.type)
-      } else {
-        const remote = await fetchRemoteUrlToTempFile(
-          urlEntry as string,
-          config.maxFileSize,
-          cipher
-        )
-        tempPath = remote.tempPath
-        size = remote.size
-        sha256 = remote.sha256
+      } catch {
+        if (!pumpAborted && !busboyErr && !uploadErr) {
+          busboyErr = new BadRequestError('Failed to read request body')
+        }
+        abortPump()
+      }
+
+      await bbFinished
+      if (uploadPromise) {
+        await uploadPromise
+      }
+
+      if (uploadErr) throw uploadErr
+      if (busboyErr) throw busboyErr
+
+      if (!uploadResult) {
+        if (!urlValue) {
+          throw new BadRequestError('Provide exactly one of "file" or "url"')
+        }
+        if (!config.allowUrlUpload) {
+          return c.text('Remote URL uploads are disabled\n', 403)
+        }
+
+        const remote = await fetchRemoteUrlStream(urlValue, config.maxFileSize)
         filename = remote.filename
-        mimeType = inferMimeType(filename, remote.mimeType)
+        mimeType = remote.mimeType
+        if (uploadId && remote.knownSize !== undefined) {
+          uploadProgress.set(uploadId, { uploaded: 0, total: remote.knownSize, done: false })
+        }
+
+        uploadResult = await uploadStreamInParts({
+          source: remote.body,
+          id,
+          partSize: config.partSize,
+          maxFileSize: config.maxFileSize,
+          knownTotalSize: remote.knownSize,
+          encryptionKey,
+          storage,
+          onProgress: reportProgress,
+        })
       }
 
-      if (size === 0) {
+      if (uploadResult.size === 0 || uploadResult.parts.length === 0) {
         return c.text('Empty files cannot be uploaded\n', 400)
-      }
-
-      if (uploadId) {
-        uploadProgress.set(uploadId, { uploaded: 0, total: size, done: false })
-      }
-
-      let id = generateId()
-      for (let attempt = 0; attempt < 10 && db.getById(id) !== null; attempt++) {
-        id = generateId()
-      }
-      if (db.getById(id) !== null) {
-        return c.text('Failed to allocate unique file ID\n', 500)
       }
 
       const ext = sanitizeExtension(filename)
       const mgmtToken = generateManagementToken()
       const mgmtTokenHash = hashToken(mgmtToken)
 
-      // Reuse existing encrypted Telegram message when identical plaintext is already stored.
-      const existing = db.findExistingBySha256(sha256)
-      let tgChatId: string
-      let tgMessageId: number
-      let tgFileId: string | null
-      let encSalt: string
-      let encIv: string
+      // Deduplicate identical plaintext by reusing existing encrypted Telegram parts.
+      const existing = db.findExistingBySha256(uploadResult.sha256)
+      let encSalt = uploadResult.encSalt
+      let encIv = uploadResult.encIv
+      let finalParts = uploadResult.parts
 
       if (existing) {
-        tgChatId = existing.tg_chat_id
-        tgMessageId = existing.tg_message_id
-        tgFileId = existing.tg_file_id
+        await cleanupUploadedParts(storage, uploadResult.parts)
         encSalt = existing.enc_salt
         encIv = existing.enc_iv
-        if (uploadId) {
-          uploadProgress.set(uploadId, { uploaded: size, total: size, done: true })
-        }
-      } else {
-        encSalt = newSalt
-        encIv = newIv
-        const tgObj = await storage.uploadFile({
-          filePath: tempPath,
-          filename: `${id}.bin`,
-          mimeType: 'application/octet-stream',
-          size,
-          caption: id,
-          onProgress: uploadId
-            ? (uploaded, total) => {
-                uploadProgress.set(uploadId, {
-                  uploaded,
-                  total: total > 0 ? total : size,
-                  done: false,
-                })
-              }
-            : undefined,
-        })
-        tgChatId = tgObj.chatId
-        tgMessageId = tgObj.messageId
-        tgFileId = tgObj.fileId
-        if (uploadId) {
-          uploadProgress.set(uploadId, { uploaded: size, total: size, done: true })
-        }
+        finalParts = existing.parts.map((p) => ({
+          ...p,
+          file_id: id,
+        }))
       }
 
-      db.insert({
-        id,
-        ext,
-        filename,
-        mime_type: mimeType,
-        size,
-        sha256,
-        tg_chat_id: tgChatId,
-        tg_message_id: tgMessageId,
-        tg_file_id: tgFileId,
-        enc_salt: encSalt,
-        enc_iv: encIv,
-        mgmt_token_hash: mgmtTokenHash,
-        created_at: nowMs,
-      })
+      db.insertWithParts(
+        {
+          id,
+          ext,
+          filename,
+          mime_type: mimeType,
+          size: uploadResult.size,
+          sha256: uploadResult.sha256,
+          enc_salt: encSalt,
+          enc_iv: encIv,
+          mgmt_token_hash: mgmtTokenHash,
+          created_at: nowMs,
+        },
+        finalParts
+      )
+
+      if (uploadId) {
+        uploadProgress.set(uploadId, {
+          uploaded: uploadResult.size,
+          total: uploadResult.size,
+          done: true,
+        })
+      }
 
       const baseUrl = resolveBaseUrl(c, config)
       const fileUrl = `${baseUrl}/${id}${ext ? `.${ext}` : ''}`
@@ -513,7 +859,7 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
           url: fileUrl,
           id,
           filename,
-          size,
+          size: uploadResult.size,
           mimeType,
           token: mgmtToken,
         })
@@ -525,11 +871,12 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
         return c.text(`${err.message}\n`, 413)
       }
       if (
-        err instanceof Error &&
-        (err.message.includes('URL') ||
-          err.message.includes('Private or loopback') ||
-          err.message.includes('Upstream') ||
-          err.message.includes('redirects'))
+        err instanceof BadRequestError ||
+        (err instanceof Error &&
+          (err.message.includes('URL') ||
+            err.message.includes('Private or loopback') ||
+            err.message.includes('Upstream') ||
+            err.message.includes('redirects')))
       ) {
         return c.text(`${err.message}\n`, 400)
       }
@@ -546,9 +893,6 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
           uploadProgress.delete(uploadId)
         }
       }
-      if (tempPath) {
-        await unlink(tempPath).catch(() => {})
-      }
     }
   })
 
@@ -561,6 +905,11 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
     const record = db.getById(id)
 
     if (!record) {
+      return c.text('Not Found\n', 404)
+    }
+
+    const parts = db.getParts(record.id)
+    if (parts.length === 0) {
       return c.text('Not Found\n', 404)
     }
 
@@ -640,17 +989,14 @@ export function createApp({ db, storage, setup, config }: CreateAppDeps): Hono {
     }
 
     try {
-      const encryptedStream = await storage.downloadStream({
-        chatId: record.tg_chat_id,
-        messageId: record.tg_message_id,
-        fileId: record.tg_file_id,
+      const encryptedStream = await createMultiPartDownloadStream(
+        parts,
         offset,
-        limit: length,
-        signal: c.req.raw.signal,
-        onRefreshedFileId: (newFileId) => {
-          db.updateTgFileId(record.tg_chat_id, record.tg_message_id, newFileId)
-        },
-      })
+        length,
+        storage,
+        db,
+        c.req.raw.signal
+      )
 
       const plainStream = createDecryptStream(
         encryptedStream,
